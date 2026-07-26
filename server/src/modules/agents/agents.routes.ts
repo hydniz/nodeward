@@ -25,26 +25,25 @@ import { Router } from 'express';
 import type { Config } from '../../config.ts';
 import type { Logger } from '../../core/logger.ts';
 import { handler, looseValidator, validateBody } from '../../core/http.ts';
-import { notFound, notImplemented } from '../../core/errors.ts';
+import { forbidden, notFound, notImplemented } from '../../core/errors.ts';
 import { asAgentId } from '../../domain/common.ts';
 import type {
   AgentBatch, AgentEvent, AgentHeartbeat, AgentRegistration, HealthReport,
-  InventoryReport,
 } from '../../domain/index.ts';
 import type { Store } from '../../store/index.ts';
 import type { HealthService } from '../health/health.service.ts';
 import type { InventoryService } from '../inventory/inventory.service.ts';
+import { asInventoryReport } from '../inventory/inventory.schema.ts';
 import { principalOf, requireAgent, requireOperator } from './agents.auth.ts';
 import type { AgentsService } from './agents.service.ts';
 
 /**
  * Validators are the loose kind for now — they assert "this is an object" and
- * hand the body on. Replace them one by one with real schemas
- * (`agents.schema.ts`); the call sites never change.
+ * hand the body on. Replace them one by one with real schemas; the call sites
+ * never change. The inventory report already has one: `inventory.schema.ts`.
  */
 const asRegistration = looseValidator<AgentRegistration>('registration');
 const asHeartbeat = looseValidator<AgentHeartbeat>('heartbeat');
-const asInventoryReport = looseValidator<InventoryReport>('inventory report');
 const asHealthReport = looseValidator<HealthReport>('health report');
 const asBatch = looseValidator<AgentBatch>('batch');
 const asEvents = (input: unknown): AgentEvent[] => (Array.isArray(input)
@@ -82,9 +81,12 @@ export function agentRoutes(
   }));
 
   router.post('/agents/:agentId/inventory', agentAuth, handler(async (req, res) => {
-    // TODO(implement): compare `report.hostId` with `principalOf(req).hostId`
-    // and refuse with 403 on a mismatch — see the rule at the top of this file.
     const report = validateBody(req, asInventoryReport);
+    // the token decides the host, never the payload (rule at the top of this
+    // file): a report about any other host is refused, whatever it claims
+    if (report.hostId !== principalOf(req).hostId) {
+      throw forbidden('report hostId does not match the host this token owns');
+    }
     await inventory.applyReport(report);
     res.status(202).json({ accepted: true, hostId: report.hostId });
   }));
