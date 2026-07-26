@@ -1,4 +1,7 @@
 import React from 'react';
+import {
+  serverPath, netPath, mapPath, isDirect, useGo,
+} from '../nav.js';
 
 const UP = '#3ecf9a';
 const WARN = '#e6b450';
@@ -24,8 +27,17 @@ function Meter({ label, value }) {
   );
 }
 
-export default function ServerModal({ server, nets, onClose, context = 'overview' }) {
+// mini overview of a host: enough to decide, with one click to the full page
+export default function ServerModal({
+  server, nets, onClose, onOpenNode, context = 'overview',
+}) {
+  const go = useGo();
   const down = server.status === 'down';
+  const openPage = () => {
+    onClose?.();
+    go(serverPath(server.id));
+  };
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -65,24 +77,49 @@ export default function ServerModal({ server, nets, onClose, context = 'overview
         )}
 
         <div className="msect">nodes · {server.nodes.length}</div>
-        {server.nodes.map((n) => (
-          <div key={n.id} className="mrow">
-            <span
-              className="dot sm"
-              style={{ background: n.down || down ? DOWN : UP }}
-            />
-            <span className="mname">{n.label}</span>
-            <span className="mdesc">{n.desc}</span>
-            <span className="mres">{n.res}</span>
-          </div>
-        ))}
+        {server.nodes.map((n) => {
+          const chip = server.chips.find((c) => (c.nodes ?? [c.id]).includes(n.id));
+          return (
+            <button
+              key={n.id}
+              type="button"
+              className="mrow as-link"
+              title="service overview · ctrl+click opens it on the host page"
+              onClick={(e) => {
+                if (isDirect(e)) {
+                  onClose?.();
+                  go(serverPath(server.id, chip?.id ?? n.id));
+                  return;
+                }
+                onOpenNode?.(server.id, chip?.id ?? n.id);
+              }}
+            >
+              <span
+                className="dot sm"
+                style={{ background: n.down || down ? DOWN : UP }}
+              />
+              <span className="mname">{n.label}</span>
+              <span className="mdesc">{n.desc}</span>
+              <span className="mres">{n.res}</span>
+            </button>
+          );
+        })}
 
         <div className="msect">interfaces · {server.interfaces.length}</div>
         {server.interfaces.map((i) => {
           const net = nets?.[i.net];
           const m = i.modal ?? {};
           return (
-            <div key={i.id} className="mrow">
+            <button
+              key={i.id}
+              type="button"
+              className="mrow as-link"
+              title={`open the ${net?.name ?? i.net} page`}
+              onClick={() => {
+                onClose?.();
+                go(netPath(i.net));
+              }}
+            >
               <span
                 className="msq"
                 style={{ background: down ? DOWN : net?.color ?? '#7f8b99' }}
@@ -102,7 +139,7 @@ export default function ServerModal({ server, nets, onClose, context = 'overview
                   </>
                 )}
               </span>
-            </div>
+            </button>
           );
         })}
 
@@ -111,7 +148,20 @@ export default function ServerModal({ server, nets, onClose, context = 'overview
           <button type="button" className="btn" disabled={down}>console</button>
           <button type="button" className="btn">logs</button>
           <button type="button" className="btn warn" disabled={down}>shutdown</button>
-          <span className="modal-link">open server page →</span>
+          <span className="modal-links">
+            {context !== 'overview' && (
+              <button
+                type="button"
+                className="modal-link as-btn"
+                onClick={() => { onClose?.(); go(mapPath(server.id)); }}
+              >
+                show on map →
+              </button>
+            )}
+            <button type="button" className="modal-link as-btn" onClick={openPage}>
+              open server page →
+            </button>
+          </span>
         </div>
       </div>
     </div>

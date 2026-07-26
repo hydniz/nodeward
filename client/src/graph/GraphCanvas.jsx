@@ -1,18 +1,20 @@
 import React, {
   useRef, useState, useEffect, useMemo, useCallback,
 } from 'react';
-import {
-  cloudPath, anchorPoint, cloudAnchor, edgeGeometry, chipCenters, dashDuration,
-} from './layout.js';
+import { cloudPath, edgeGeometry, dashDuration } from './layout.js';
 import InterfacePanel from './InterfacePanel.jsx';
 import NetworkPanel from './NetworkPanel.jsx';
 import P2PPanel from './P2PPanel.jsx';
+import BundlePanel from './BundlePanel.jsx';
+import { serverPath, servicePath, netPath, useOpen } from '../nav.js';
+import { primaryNode } from '../services.js';
 
 const UP = '#3ecf9a';
 const WARN = '#e6b450';
 const DOWN = '#e0564a';
 
-const PANEL_W = 340;
+const PANEL_MAX = 340;
+const HEADER_H = 52; // must match HEADER_H in shared/autoLayout.js
 
 const statusColor = (s) => (s === 'up' ? UP : s === 'warning' ? WARN : DOWN);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(v, hi));
@@ -23,12 +25,18 @@ export default function GraphCanvas({
 }) {
   const { world, networks, edges } = topology;
   const p2p = topology.p2p ?? [];
+  const bundles = topology.bundles ?? [];
+  const labels = topology.labels ?? [];
   const wrapRef = useRef(null);
+  const open = useOpen();
   const [view, setView] = useState(null);
   const [hover, setHover] = useState(null);
+  const [hoverChip, setHoverChip] = useState(null);
   const interacted = useRef(false);
   const drag = useRef(null);
   const moved = useRef(false);
+  const pointers = useRef(new Map());
+  const pinch = useRef(null);
 
   const netsById = useMemo(
     () => Object.fromEntries(networks.map((n) => [n.id, n])), [networks],
@@ -36,154 +44,34 @@ export default function GraphCanvas({
   const serversById = useMemo(
     () => Object.fromEntries(servers.map((s) => [s.id, s])), [servers],
   );
-  const chipsById = useMemo(
-    () => Object.fromEntries(servers.map((s) => [s.id, chipCenters(s)])), [servers],
-  );
   const clouds = useMemo(() => networks.filter((n) => !n.virtual), [networks]);
   const cloudD = useMemo(
     () => Object.fromEntries(clouds.map((n) => [n.id, cloudPath(n)])), [clouds],
   );
 
-  // ---- resolved geometry ---------------------------------------------------
-  // server-level edges attach to border ports; node-level edges start at the
-  // service chip's ring (drawn above the box); p2p links join two ports.
+  // ---- paths -------------------------------------------------------------
+  // the backend ships every endpoint, bend and label box (see LAYOUT.md), so
+  // there is nothing to compute here but the svg path strings
   const geo = useMemo(() => {
-    const serverEdges = [];
-    const nodeEdges = [];
-    const ports = {};
-    edges.forEach((e) => {
-      const s = serversById[e.server];
-      const n = netsById[e.net];
-      if (!s || !n) return;
-      if (e.ring) {
-        const chip = chipsById[s.id]?.[e.node];
-        if (!chip) return;
-        const dx = n.x - chip.cx;
-        const dy = n.y - chip.cy;
-        const l = Math.hypot(dx, dy) || 1;
-        const p0 = [
-          chip.cx + (dx / l) * (chip.r + 6),
-          chip.cy + (dy / l) * (chip.r + 6),
-        ];
-        const g = edgeGeometry(p0, cloudAnchor(n, p0, e.toNudge), {
-          bend: e.bend, ctrl: e.ctrl,
-        });
-        nodeEdges.push({ e, n, s, p0, d: g.d, at: g.at });
-      } else {
-        const p0 = anchorPoint(s, e.anchor);
-        const g = edgeGeometry(p0, cloudAnchor(n, p0, e.toNudge), {
-          bend: e.bend, ctrl: e.ctrl,
-        });
-        serverEdges.push({ e, n, p0, d: g.d, at: g.at });
-        (ports[s.id] ??= []).push({
-          key: e.id, iface: e.iface, p0,
-          color: e.state === 'down' ? DOWN : n.color,
-        });
-      }
-    });
-    const p2pGeo = p2p.map((L) => {
-      const sa = serversById[L.a.server];
-      const sb = serversById[L.b.server];
-      if (!sa || !sb) return null;
-      const p0 = anchorPoint(sa, L.a.anchor);
-      const p1 = anchorPoint(sb, L.b.anchor);
-      const g = edgeGeometry(p0, p1, { bend: L.bend });
-      (ports[sa.id] ??= []).push({
-        key: `${L.id}-a`, iface: L.a.iface, p0, color: L.color,
-      });
-      (ports[sb.id] ??= []).push({
-        key: `${L.id}-b`, iface: L.b.iface, p0: p1, color: L.color,
-      });
-      return { L, d: g.d, at: g.at, p0, p1, mid: g.at(0.5) };
-    }).filter(Boolean);
-    return { serverEdges, nodeEdges, p2pGeo, ports };
-  }, [edges, p2p, serversById, netsById, chipsById]);
+    const path = (o) => edgeGeometry(o.from, o.to, { bend: o.bend, ctrl: o.ctrl }).d;
+    const drawable = edges.filter((e) => e.from && e.to);
+    return {
+      hostEdges: drawable.filter((e) => !e.ring).map((e) => ({ e, d: path(e) })),
+      nodeEdges: drawable.filter((e) => e.ring).map((e) => ({ e, d: path(e) })),
+      trunks: bundles.map((b) => ({ b, d: path(b) })),
+      links: p2p.filter((L) => L.from && L.to).map((L) => ({
+        L, d: path(L), mid: edgeGeometry(L.from, L.to, { bend: L.bend }).at(0.5),
+      })),
+    };
+  }, [edges, bundles, p2p]);
 
-  // ip labels sit right at the interface they belong to: as a tag next to
-  // the port (offset away from the box side), or — for node-level links —
-  // at the point where the link exits the server box
-  const labels = useMemo(() => {
-    const tagOffset = (side, w) => {
-      switch (side) {
-        case 'bottom': return [0, 19];
-        case 'left': return [-(w / 2 + 12), 0];
-        case 'right': return [w / 2 + 12, 0];
-        default: return [0, -19]; // top
-      }
-    };
-    // walk along a node-level path until it leaves the server box
-    const boxExit = (s, at) => {
-      for (let t = 0; t <= 1; t += 0.02) {
-        const p = at(t);
-        if (p[0] < s.x || p[0] > s.x + s.w || p[1] < s.y || p[1] > s.y + s.h) {
-          const side = p[1] <= s.y ? 'top'
-            : p[1] >= s.y + s.h ? 'bottom'
-              : p[0] <= s.x ? 'left' : 'right';
-          return { p, side };
-        }
-      }
-      return { p: at(1), side: 'top' };
-    };
-    const out = [];
-    const push = (key, edgeId, text, color, base, side, off, click, anchor) => {
-      const w = text.length * 7.4 + 14;
-      const tag = tagOffset(side, w);
-      out.push({
-        key, edgeId, text, color, w, side,
-        x: base[0] + tag[0] + (off?.[0] || 0),
-        y: base[1] + tag[1] + (off?.[1] || 0),
-        click, anchor,
-      });
-    };
-    geo.serverEdges.forEach(({ e, n, p0 }) => {
-      if (!e.label) return;
-      push(e.id, e.id, e.label, e.state === 'down' ? DOWN : n.color,
-        p0, e.anchor.side, e.labelOff,
-        { kind: 'iface', serverId: e.server, ifaceId: e.iface }, p0);
+  const portsByServer = useMemo(() => {
+    const out = {};
+    (topology.ports ?? []).forEach((p) => {
+      (out[p.server] ??= []).push(p);
     });
-    geo.nodeEdges.forEach(({ e, n, s, p0, at }) => {
-      if (!e.label) return;
-      const exit = boxExit(s, at);
-      push(e.id, e.id, e.label, n.color, exit.p, exit.side, e.labelOff,
-        { kind: 'iface', serverId: e.server, ifaceId: e.iface }, p0);
-    });
-    geo.p2pGeo.forEach(({ L, p0, p1, mid }) => {
-      (L.labels ?? []).forEach((lb, i) => {
-        const atB = lb.end === 'b';
-        push(`${L.id}-l${i}`, L.id, lb.text, L.color,
-          atB ? p1 : p0, (atB ? L.b : L.a).anchor?.side ?? 'top', lb.off,
-          { kind: 'p2p', linkId: L.id }, mid);
-      });
-    });
-    // R7: resolve label collisions with minimal deterministic nudges —
-    // separate along whichever axis needs the smaller move, but never push
-    // a label back across its own interface into the box
-    for (let pass = 0; pass < 3; pass++) {
-      for (let i = 0; i < out.length; i++) {
-        for (let j = i + 1; j < out.length; j++) {
-          const a = out[i];
-          const b = out[j];
-          const needX = (a.w + b.w) / 2 + 8 - Math.abs(a.x - b.x);
-          const needY = 19 + 7 - Math.abs(a.y - b.y);
-          if (needX <= 0 || needY <= 0) continue;
-          if (needX <= needY) {
-            const dir = a.x <= b.x ? 1 : -1;
-            a.x -= (dir * needX) / 2;
-            b.x += (dir * needX) / 2;
-          } else {
-            const [up, down] = a.y <= b.y ? [a, b] : [b, a];
-            if (up.side === 'bottom') down.y += needY; // up would enter its box
-            else if (down.side === 'top') up.y -= needY;
-            else {
-              up.y -= needY / 2;
-              down.y += needY / 2;
-            }
-          }
-        }
-      }
-    }
     return out;
-  }, [geo]);
+  }, [topology.ports]);
 
   // ---- viewport: fit / zoom / pan -----------------------------------------
   const fit = useCallback(() => {
@@ -243,12 +131,45 @@ export default function GraphCanvas({
     });
   };
 
+  // one pointer pans, two pointers pinch — the same code path for mouse,
+  // touchpad and touch screens
   const onPointerDown = (e) => {
-    if (e.button !== 0) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.current.size === 2) {
+      const [a, b] = [...pointers.current.values()];
+      pinch.current = { dist: Math.hypot(a.x - b.x, a.y - b.y) };
+      drag.current = null;
+      moved.current = true; // a pinch is never a click
+      return;
+    }
     drag.current = { sx: e.clientX, sy: e.clientY };
     moved.current = false;
   };
+
   const onPointerMove = (e) => {
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointers.current.size >= 2 && pinch.current) {
+      const [a, b] = [...pointers.current.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      const rect = wrapRef.current.getBoundingClientRect();
+      const mx = (a.x + b.x) / 2 - rect.left;
+      const my = (a.y + b.y) / 2 - rect.top;
+      const factor = dist / (pinch.current.dist || dist);
+      pinch.current.dist = dist;
+      interacted.current = true;
+      setView((v) => {
+        if (!v) return v;
+        const k = Math.min(3, Math.max(0.3, v.k * factor));
+        const wx = (mx - v.x) / v.k;
+        const wy = (my - v.y) / v.k;
+        return { k, x: mx - wx * k, y: my - wy * k };
+      });
+      return;
+    }
+
     if (!drag.current) return;
     const dx = e.clientX - drag.current.sx;
     const dy = e.clientY - drag.current.sy;
@@ -264,28 +185,39 @@ export default function GraphCanvas({
       setView((v) => v && { ...v, x: v.x + dx, y: v.y + dy });
     }
   };
-  const onPointerUp = () => {
+
+  const onPointerUp = (e) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
     drag.current = null;
   };
 
   // ---- interaction helpers -------------------------------------------------
   // panels are anchored to the clicked element in world coordinates, so the
-  // card visibly belongs to its element and follows pan/zoom
+  // card visibly belongs to its element and follows pan/zoom.
+  // ctrl/cmd on any element skips the overview and opens its page (nav.js).
   const openPanel = (e, spec, anchor, color) => {
     e.stopPropagation();
     if (moved.current) return;
+    const target = spec.kind === 'net' || spec.kind === 'bundle' || spec.kind === 'p2p'
+      ? netPath(spec.netId ?? bundles.find((b) => b.id === spec.bundleId)?.net
+        ?? p2p.find((L) => L.id === spec.linkId)?.net)
+      : serverPath(spec.serverId);
+    if (open(e, target)) return;
     onPanel({ ...spec, anchor, color });
   };
 
   const clickServer = (e, serverId) => {
     e.stopPropagation();
     if (moved.current) return;
+    if (open(e, serverPath(serverId))) return;
     onSelectServer(serverId);
   };
 
   const clickNode = (e, serverId, chipId) => {
     e.stopPropagation();
     if (moved.current) return;
+    if (open(e, servicePath(serverId, primaryNode(serversById[serverId], chipId)))) return;
     onSelectNode(serverId, chipId);
   };
 
@@ -304,6 +236,7 @@ export default function GraphCanvas({
     const fe = edges.filter((e) => e.net === filter);
     const sv = new Set(fe.map((e) => e.server));
     const ids = new Set(fe.map((e) => e.id));
+    bundles.forEach((b) => b.net === filter && ids.add(b.id));
     p2p.forEach((L) => {
       if (L.net === filter) {
         ids.add(L.id);
@@ -312,7 +245,7 @@ export default function GraphCanvas({
       }
     });
     return { servers: sv, nets: new Set([filter]), edges: ids };
-  }, [filter, servers, edges, p2p]);
+  }, [filter, servers, edges, bundles, p2p]);
 
   const dimOf = (kind, id) => {
     if (selectedId) return kind === 'server' && id === selectedId ? 1 : 0.16;
@@ -326,6 +259,7 @@ export default function GraphCanvas({
   const activeEdgeId = useMemo(() => {
     if (!panel) return null;
     if (panel.kind === 'p2p') return panel.linkId;
+    if (panel.kind === 'bundle') return panel.bundleId;
     if (panel.kind !== 'iface') return null;
     const e = edges.find(
       (x) => x.server === panel.serverId && x.iface === panel.ifaceId,
@@ -338,14 +272,17 @@ export default function GraphCanvas({
     return L?.id ?? null;
   }, [panel, edges, p2p]);
 
-  const renderEdge = (key, d, color, { traffic, down, hoverId, click, anchor, width = 1.4 }) => {
+  const renderEdge = (key, d, color, {
+    traffic, down, hoverId, groupId, click, anchor, width = 1.4, dashed = true,
+  }) => {
     const dur = down ? 0 : dashDuration(traffic);
-    const lit = hover === hoverId || activeEdgeId === hoverId;
+    const lit = hover === hoverId || hover === groupId
+      || activeEdgeId === hoverId || activeEdgeId === groupId;
     return (
       <g key={key} opacity={dimOf('edge', hoverId)} className="edge">
         <path
           d={d}
-          className={`edge-line${down ? ' is-down' : ''}`}
+          className={`edge-line${down ? ' is-down' : ''}${dashed ? '' : ' is-solid'}`}
           stroke={color}
           strokeWidth={lit ? width + 0.9 : width}
           style={{
@@ -368,6 +305,7 @@ export default function GraphCanvas({
   const panelServer = panel?.serverId ? serversById[panel.serverId] : null;
   const panelIface = panelServer?.interfaces.find((i) => i.id === panel.ifaceId);
   const panelLink = panel?.linkId ? p2p.find((L) => L.id === panel.linkId) : null;
+  const panelBundle = panel?.bundleId ? bundles.find((b) => b.id === panel.bundleId) : null;
 
   let anchorPt = null;
   let panelStyle = null;
@@ -375,13 +313,15 @@ export default function GraphCanvas({
   if (panel?.anchor && view && wrapRef.current) {
     const bw = wrapRef.current.clientWidth;
     const bh = wrapRef.current.clientHeight;
+    // on a phone the card takes the width it can get
+    const PANEL_W = Math.min(PANEL_MAX, bw - 20);
     anchorPt = [
       panel.anchor[0] * view.k + view.x,
       panel.anchor[1] * view.k + view.y,
     ];
     let left = anchorPt[0] + 24;
     if (left + PANEL_W > bw - 10) left = anchorPt[0] - 24 - PANEL_W;
-    left = clamp(left, 10, bw - PANEL_W - 10);
+    left = clamp(left, 10, Math.max(10, bw - PANEL_W - 10));
     const top = clamp(anchorPt[1] - 48, 10, Math.max(10, bh - 380));
     panelStyle = { left, top, width: PANEL_W };
     const ex = anchorPt[0] < left ? left : anchorPt[0] > left + PANEL_W ? left + PANEL_W : anchorPt[0];
@@ -399,6 +339,8 @@ export default function GraphCanvas({
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onPointerLeave={onPointerUp}
       onClick={() => {
         if (!moved.current) onPanel(null);
       }}
@@ -407,17 +349,40 @@ export default function GraphCanvas({
         <svg className="graph-svg">
           <g transform={`translate(${view.x},${view.y}) scale(${view.k})`}>
 
-            {/* server-level edges + p2p links (under clouds and boxes) */}
+            {/* host-level edges, trunks and p2p links (under clouds/boxes) */}
             <g>
-              {geo.serverEdges.map(({ e, n, p0, d }) => renderEdge(e.id, d,
-                e.state === 'down' ? DOWN : n.color, {
+              {geo.hostEdges.map(({ e, d }) => renderEdge(e.id, d,
+                e.state === 'down' ? DOWN : netsById[e.net]?.color, {
                   traffic: e.traffic,
                   down: e.state === 'down',
                   hoverId: e.id,
+                  groupId: e.bundle,
                   click: { kind: 'iface', serverId: e.server, ifaceId: e.iface },
-                  anchor: p0,
+                  anchor: e.from,
                 }))}
-              {geo.p2pGeo.map(({ L, d, mid }) => renderEdge(L.id, d, L.color, {
+              {geo.trunks.map(({ b, d }) => (
+                <g key={b.id}>
+                  {renderEdge(b.id, d, b.down ? DOWN : b.color, {
+                    traffic: b.traffic,
+                    down: b.down,
+                    hoverId: b.id,
+                    click: { kind: 'bundle', bundleId: b.id },
+                    anchor: b.from,
+                    width: 2.1,
+                  })}
+                  <circle
+                    className="trunk-hub"
+                    cx={b.from[0]} cy={b.from[1]} r="3.4"
+                    fill={b.down ? DOWN : b.color}
+                    opacity={dimOf('edge', b.id)}
+                    onClick={(ev) => openPanel(ev, { kind: 'bundle', bundleId: b.id },
+                      b.from, b.color)}
+                    onMouseEnter={() => setHover(b.id)}
+                    onMouseLeave={() => setHover(null)}
+                  />
+                </g>
+              ))}
+              {geo.links.map(({ L, d, mid }) => renderEdge(L.id, d, L.color, {
                 traffic: L.traffic,
                 down: false,
                 hoverId: L.id,
@@ -455,17 +420,19 @@ export default function GraphCanvas({
               ))}
             </g>
 
-            {/* server boxes with name, mgmt address, chips and ports */}
+            {/* server boxes: protected header, service zone, ports */}
             <g>
               {servers.map((s) => {
-                const chips = chipsById[s.id];
                 const down = s.status === 'down';
                 const sel = selectedId === s.id;
                 const nameW = s.name.length * 9.2;
+                const hy = s.headerY ?? s.y;
+                const zoneTop = s.zone?.side === 'top';
                 return (
                   <g
                     key={s.id}
-                    className={`server${down ? ' is-down' : ''}`}
+                    className={`server${down ? ' is-down' : ''}${
+                      hoverChip?.startsWith(`${s.id}/`) ? ' chip-focus' : ''}`}
                     opacity={sel ? 1 : dimOf('server', s.id)}
                     onClick={(e) => clickServer(e, s.id)}
                   >
@@ -481,32 +448,40 @@ export default function GraphCanvas({
                       stroke={sel ? UP : down ? 'rgba(224,86,74,.55)' : undefined}
                       strokeDasharray={down ? '5 4' : undefined}
                     />
+                    {s.chips.length > 0 && (
+                      <line
+                        className="zone-rule"
+                        x1={s.x + 1} x2={s.x + s.w - 1}
+                        y1={zoneTop ? hy : hy + HEADER_H}
+                        y2={zoneTop ? hy : hy + HEADER_H}
+                      />
+                    )}
                     <circle
-                      cx={s.x + 17} cy={s.y + 21} r="4"
+                      cx={s.x + 17} cy={hy + 21} r="4"
                       fill={statusColor(s.status)} className="server-dot"
                     />
-                    <text className="server-name" x={s.x + 29} y={s.y + 26}>
+                    <text className="server-name" x={s.x + 29} y={hy + 26}>
                       {s.name}
                     </text>
                     {s.mgmt && (
-                      <text className="server-mgmt" x={s.x + 29} y={s.y + 44}>
+                      <text className="server-mgmt" x={s.x + 29} y={hy + 44}>
                         {s.mgmt}
                       </text>
                     )}
                     {s.tag && (
-                      <text className="server-tag" x={s.x + 35 + nameW} y={s.y + 25}>
+                      <text className="server-tag" x={s.x + 35 + nameW} y={hy + 25}>
                         {s.tag}
                       </text>
                     )}
                     {s.status === 'warning' && (
                       <g>
                         <rect
-                          x={s.x + 33 + nameW} y={s.y + 13} width="15" height="15"
+                          x={s.x + 33 + nameW} y={hy + 13} width="15" height="15"
                           rx="3" fill="rgba(230,180,80,.13)"
                           stroke="rgba(230,180,80,.55)" strokeWidth="1"
                         />
                         <text
-                          x={s.x + 40.5 + nameW} y={s.y + 25}
+                          x={s.x + 40.5 + nameW} y={hy + 25}
                           className="warn-glyph"
                         >
                           !
@@ -516,50 +491,33 @@ export default function GraphCanvas({
                     {down && (
                       <g>
                         <rect
-                          x={s.x + 35 + nameW} y={s.y + 13} width="46" height="15"
+                          x={s.x + 35 + nameW} y={hy + 13} width="46" height="15"
                           rx="3" fill="rgba(224,86,74,.12)"
                           stroke="rgba(224,86,74,.5)" strokeWidth="1"
                         />
-                        <text x={s.x + 58 + nameW} y={s.y + 24.5} className="down-glyph">
+                        <text x={s.x + 58 + nameW} y={hy + 24.5} className="down-glyph">
                           DOWN
                         </text>
                       </g>
                     )}
 
-                    {s.chips.map((c) => {
-                      const p = chips[c.id];
-                      return (
-                        <g key={c.id} onClick={(e) => clickNode(e, s.id, c.id)}>
-                          {c.ring && (
-                            <circle
-                              cx={p.cx} cy={p.cy} r={p.r + 4} fill="none"
-                              stroke={c.ring} strokeOpacity="0.5" strokeWidth="1.2"
-                            />
-                          )}
-                          <circle cx={p.cx} cy={p.cy} r={p.r} className="node-chip" />
-                          <text x={p.cx} y={p.cy + 3.8} className="chip-label">
-                            {c.label}
-                          </text>
-                        </g>
-                      );
-                    })}
-
-                    {(geo.ports[s.id] || []).map((pt) => (
+                    {(portsByServer[s.id] || []).map((pt) => (
                       <g key={pt.key}>
                         <rect
                           className="port"
-                          x={pt.p0[0] - 4} y={pt.p0[1] - 4}
-                          width="8" height="8" rx="1" fill={pt.color}
+                          x={pt.at[0] - 4} y={pt.at[1] - 4}
+                          width="8" height="8" rx="1"
+                          fill={pt.down ? DOWN : pt.color}
                           onClick={(ev) => openPanel(ev, {
                             kind: 'iface', serverId: s.id, ifaceId: pt.iface,
-                          }, pt.p0, pt.color)}
+                          }, pt.at, pt.color)}
                         />
                         <rect
                           className="anchor-hit"
-                          x={pt.p0[0] - 11} y={pt.p0[1] - 11} width="22" height="22"
+                          x={pt.at[0] - 11} y={pt.at[1] - 11} width="22" height="22"
                           onClick={(ev) => openPanel(ev, {
                             kind: 'iface', serverId: s.id, ifaceId: pt.iface,
-                          }, pt.p0, pt.color)}
+                          }, pt.at, pt.color)}
                         />
                       </g>
                     ))}
@@ -568,35 +526,111 @@ export default function GraphCanvas({
               })}
             </g>
 
-            {/* node-level edges — drawn above boxes so the link visibly
-                starts at the service chip (sidecar / cni) */}
+            {/* service-level edges — above the boxes, so a link visibly
+                starts at the chip that owns it (sidecar / cni) */}
             <g>
-              {geo.nodeEdges.map(({ e, n, p0, d }) => renderEdge(e.id, d, n.color, {
-                traffic: e.traffic,
-                down: false,
-                hoverId: e.id,
-                click: { kind: 'iface', serverId: e.server, ifaceId: e.iface },
-                anchor: p0,
-              }))}
+              {geo.nodeEdges.map(({ e, d }) => renderEdge(e.id, d,
+                netsById[e.net]?.color, {
+                  traffic: e.traffic,
+                  down: e.state === 'down',
+                  hoverId: e.id,
+                  groupId: e.bundle,
+                  click: { kind: 'iface', serverId: e.server, ifaceId: e.iface },
+                  anchor: e.from,
+                }))}
+            </g>
+
+            {/* service chips — above the service edges, so a stub that
+                passes a neighbouring chip runs behind it instead of over it.
+                hovering a chip highlights the *chip*: a click here selects the
+                service, not its host */}
+            <g>
+              {servers.map((s) => (
+                <g
+                  key={s.id}
+                  opacity={selectedId === s.id ? 1 : dimOf('server', s.id)}
+                >
+                  {s.chips.map((c) => {
+                    const lit = hoverChip === `${s.id}/${c.id}`;
+                    return (
+                      <g
+                        key={c.id}
+                        className={`chip${lit ? ' is-hover' : ''}`}
+                        onClick={(e) => clickNode(e, s.id, c.id)}
+                        onMouseEnter={() => setHoverChip(`${s.id}/${c.id}`)}
+                        onMouseLeave={() => setHoverChip(null)}
+                      >
+                        {c.ring && (
+                          <circle
+                            className="chip-ring"
+                            cx={c.cx} cy={c.cy} r={c.r + 4} fill="none"
+                            stroke={c.ring}
+                            strokeOpacity={lit ? 0.95 : 0.5}
+                            strokeWidth={lit ? 1.6 : 1.2}
+                          />
+                        )}
+                        {lit && (
+                          <circle
+                            className="chip-halo"
+                            cx={c.cx} cy={c.cy} r={c.r + (c.ring ? 9 : 6)}
+                            fill="none"
+                          />
+                        )}
+                        <circle cx={c.cx} cy={c.cy} r={c.r} className="node-chip" />
+                        <text x={c.cx} y={c.cy + 3.8} className="chip-label">
+                          {c.label}
+                        </text>
+                      </g>
+                    );
+                  })}
+                </g>
+              ))}
             </g>
 
             {/* ip labels — drawn last so they are never hidden */}
             <g>
               {labels.map((lb) => {
-                const { w } = lb;
+                const stack = lb.rows.length > 1;
+                const top = lb.y - lb.h / 2;
+                const left = lb.x - lb.w / 2;
+                const opacity = Math.max(...lb.edgeIds.map((id) => dimOf('edge', id)));
                 return (
-                  <g
-                    key={lb.key}
-                    className="edge-label"
-                    opacity={dimOf('edge', lb.edgeId)}
-                    onClick={(ev) => openPanel(ev, lb.click, lb.anchor, lb.color)}
-                    onMouseEnter={() => setHover(lb.edgeId)}
-                    onMouseLeave={() => setHover(null)}
-                  >
-                    <rect x={lb.x - w / 2} y={lb.y - 9.5} width={w} height="19" rx="3" />
-                    <text x={lb.x} y={lb.y + 4.2} fill={lb.color}>
-                      {lb.text}
-                    </text>
+                  <g key={lb.id} className="edge-label" opacity={opacity}>
+                    <rect x={left} y={top} width={lb.w} height={lb.h} rx="3" />
+                    {lb.rows.map((r, i) => {
+                      const ry = top + (stack ? 4 : 0) + i * 19;
+                      const color = r.down ? DOWN : r.color;
+                      return (
+                        <g
+                          key={r.edgeId}
+                          onClick={(ev) => openPanel(ev, r.click, lb.anchor, color)}
+                          onMouseEnter={() => setHover(r.edgeId)}
+                          onMouseLeave={() => setHover(null)}
+                        >
+                          <rect
+                            className="label-hit"
+                            x={left} y={ry} width={lb.w} height="19"
+                          />
+                          {stack ? (
+                            <>
+                              <text className="label-tag" x={left + 11} y={ry + 13.6}>
+                                {r.tag}
+                              </text>
+                              <text
+                                x={left + 11 + lb.tagW + 8} y={ry + 13.6}
+                                fill={color}
+                              >
+                                {r.text}
+                              </text>
+                            </>
+                          ) : (
+                            <text x={lb.x} y={ry + 13.6} fill={color} textAnchor="middle">
+                              {r.text}
+                            </text>
+                          )}
+                        </g>
+                      );
+                    })}
                   </g>
                 );
               })}
@@ -630,11 +664,12 @@ export default function GraphCanvas({
         onClick={(e) => e.stopPropagation()}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <span><i className="lg-port" /> port = server-interface</span>
-        <span><i className="lg-ring" /> ring = service-interface</span>
+        <span><i className="lg-port" /> port = host interface</span>
+        <span><i className="lg-ring" /> ring = service interface</span>
+        <span><i className="lg-hub" /> hub = links bundled into one trunk</span>
         <span>cloud = network (star) · direct line = p2p vpn ·
-          dash speed = traffic · click: server/service → modal ·
-          interface/link → panel</span>
+          dash speed = traffic · click anything → overview card ·
+          <b>ctrl+click → its page</b></span>
       </div>
 
       <div
@@ -682,6 +717,19 @@ export default function GraphCanvas({
           serversById={serversById}
           style={panelStyle}
           onClose={() => onPanel(null)}
+        />
+      )}
+      {panel?.kind === 'bundle' && panelBundle && panelStyle && (
+        <BundlePanel
+          bundle={panelBundle}
+          net={netsById[panelBundle.net]}
+          server={serversById[panelBundle.server]}
+          edges={edges}
+          style={panelStyle}
+          onClose={() => onPanel(null)}
+          onOpenIface={(serverId, ifaceId, at, color) => onPanel({
+            kind: 'iface', serverId, ifaceId, anchor: at, color,
+          })}
         />
       )}
     </div>

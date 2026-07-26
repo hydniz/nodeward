@@ -1,6 +1,17 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useApi } from '../api.js';
-import ServerModal from '../components/ServerModal.jsx';
+import NodeModal from '../components/NodeModal.jsx';
+import ServerDetail from '../components/ServerDetail.jsx';
+import MorphLayout from '../components/MorphLayout.jsx';
+import InterfacePanel from '../graph/InterfacePanel.jsx';
+import {
+  PageHead, Search, Chips, FilterRow, Tile, TileRow, MasterList, MiniModal,
+} from '../components/ui.jsx';
+import { primaryNode } from '../services.js';
+import {
+  isDirect, netPath, servicePath, useGo,
+} from '../nav.js';
 
 const UP = '#3ecf9a';
 const WARN = '#e6b450';
@@ -15,37 +26,67 @@ function Pct({ value }) {
 }
 
 const COLS = [
-  ['name', 'server'],
-  ['mgmtIp', 'mgmt ip'],
-  ['cpu', 'cpu'],
-  ['ram', 'ram'],
-  ['disk', 'disk'],
-  ['nodes', 'nodes'],
-  [null, 'networks'],
-  ['uptimeDays', 'uptime'],
+  ['name', 'server', ''],
+  ['mgmtIp', 'mgmt ip', ''],
+  ['cpu', 'cpu', 'mob-hide'],
+  ['ram', 'ram', 'mob-hide'],
+  ['disk', 'disk', 'mob-hide'],
+  ['nodes', 'nodes', 'mob-hide'],
+  [null, 'networks', 'mob-hide'],
+  ['uptimeDays', 'uptime', ''],
+];
+
+// public hosts first — same reading order as the bands on the map
+const GROUPS = [
+  ['public', 'public hosts'],
+  ['edge', 'private / edge'],
 ];
 
 export default function ServersPage() {
   const { data: srv } = useApi('/api/servers');
   const { data: summary } = useApi('/api/summary');
   const { data: topo } = useApi('/api/topology');
+  const { data: dom } = useApi('/api/domains');
+  const [params, setParams] = useSearchParams();
+  const go = useGo();
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
   const [netFilter, setNetFilter] = useState(null);
   const [sort, setSort] = useState({ key: null, dir: 1 });
-  const [modalId, setModalId] = useState(null);
+  // mini overview for the things that live elsewhere: node | iface
+  const [modal, setModal] = useState(null);
 
-  useEffect(() => {
-    const onKey = (e) => e.key === 'Escape' && setModalId(null);
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  const selectedId = params.get('server');
+  const nodeParam = params.get('node');
 
   const servers = srv?.servers ?? [];
   const netsById = useMemo(
     () => Object.fromEntries((topo?.networks ?? []).map((n) => [n.id, n])),
     [topo],
   );
+  const providerIds = useMemo(
+    () => new Set((topo?.networks ?? []).filter((n) => n.role === 'provider').map((n) => n.id)),
+    [topo],
+  );
+  const groupOf = (s) => (s.netBadges.some((b) => providerIds.has(b.net)) ? 'public' : 'edge');
+
+  const openServer = (id, node) => {
+    setModal(null);
+    setParams(node ? { server: id, node } : { server: id });
+  };
+  // MorphLayout animates the way out, so the url can change right away
+  const closeDetail = () => setParams({});
+
+  // escape closes the mini overview first, then the expanded host view
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      if (modal) setModal(null);
+      else if (selectedId) closeDetail();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modal, selectedId]);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -75,7 +116,16 @@ export default function ServersPage() {
     return list;
   }, [servers, query, status, netFilter, sort]);
 
-  const modal = servers.find((s) => s.id === modalId);
+  const detail = servers.find((s) => s.id === selectedId);
+  const modalServer = modal ? servers.find((s) => s.id === modal.serverId) : null;
+  const modalChip = modal?.kind === 'node'
+    ? modalServer?.chips.find((c) => c.id === modal.chipId)
+      ?? modalServer?.chips.find((c) => (c.nodes ?? []).includes(modal.chipId))
+    : null;
+  const modalIface = modal?.kind === 'iface'
+    ? modalServer?.interfaces.find((i) => i.id === modal.ifaceId)
+    : null;
+
   const counts = {
     all: servers.length,
     up: servers.filter((s) => s.status === 'up').length,
@@ -83,151 +133,223 @@ export default function ServersPage() {
     down: servers.filter((s) => s.status === 'down').length,
   };
   const nodeTotal = servers.reduce((n, s) => n + s.nodes.length, 0);
+  const worst = servers.filter((s) => s.disk != null).sort((a, b) => b.disk - a.disk)[0];
 
   const toggleSort = (key) => {
     if (!key) return;
     setSort((s) => (s.key === key ? { key, dir: -s.dir } : { key, dir: 1 }));
   };
 
+  const groups = GROUPS.map(([g, label]) => ({
+    id: g,
+    label,
+    items: rows.filter((s) => groupOf(s) === g).map((s) => ({
+      id: s.id,
+      name: s.name,
+      kind: s.host,
+      color: statusColor(s.status),
+      count: s.nodes.length,
+      state: s.status === 'down' ? `down ${s.downFor}` : s.uptime,
+      bad: s.status === 'down',
+    })),
+  }));
+
   return (
     <div className="page scroll">
-      <header className="page-head">
-        <div>
-          <h1>Servers</h1>
-          <div className="page-sub">{servers.length} hosts · {nodeTotal} nodes</div>
-        </div>
-        <div className="head-tools">
-          <input
-            className="search"
-            placeholder="search hosts, ips…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <button type="button" className="add-btn">+ Add server</button>
-        </div>
-      </header>
+      <PageHead
+        title="Servers"
+        sub={detail
+          ? `${servers.length} hosts · ${detail.name} open`
+          : `${servers.length} hosts · ${nodeTotal} nodes`}
+      >
+        <Search value={query} onChange={setQuery} placeholder="search hosts, ips…" />
+        <button type="button" className="add-btn">+ Add server</button>
+      </PageHead>
 
-      <div className="filter-row">
-        {[
-          ['all', `all ${counts.all}`, null],
-          ['up', `up ${counts.up}`, UP],
-          ['warning', `warning ${counts.warning}`, WARN],
-          ['down', `down ${counts.down}`, DOWN],
-        ].map(([id, label, color]) => (
-          <button
-            key={id}
-            type="button"
-            className={`chip${status === id ? ' active' : ''}`}
-            onClick={() => setStatus(id)}
-          >
-            {color && <span className="chip-dot" style={{ background: color }} />}
-            {label}
-          </button>
-        ))}
+      <FilterRow
+        meta={netFilter
+          ? `filtered to ${netsById[netFilter]?.name ?? netFilter}`
+          : `${rows.length} of ${servers.length} shown`}
+      >
+        <Chips
+          options={[
+            ['all', `all ${counts.all}`, null],
+            ['up', `up ${counts.up}`, UP],
+            ['warning', `warning ${counts.warning}`, WARN],
+            ['down', `down ${counts.down}`, DOWN],
+          ]}
+          value={status}
+          onChange={setStatus}
+        />
         {netFilter && (
-          <button
-            type="button"
-            className="chip active"
-            onClick={() => setNetFilter(null)}
-          >
+          <button type="button" className="chip active" onClick={() => setNetFilter(null)}>
             net: {netsById[netFilter]?.name ?? netFilter} ×
           </button>
         )}
-        <span className="filter-avg">
-          avg cpu {summary?.avgCpu ?? '—'}% · avg ram {summary?.avgRam ?? '—'}%
-        </span>
-      </div>
+      </FilterRow>
 
-      <div className="table-wrap">
-        <table className="servers-table">
-          <thead>
-            <tr>
-              {COLS.map(([key, label]) => (
-                <th key={label} onClick={() => toggleSort(key)}>
-                  {label}
-                  {key && sort.key === key && (
-                    <span className="sort-arrow">{sort.dir === 1 ? ' ▲' : ' ▼'}</span>
-                  )}
-                </th>
-              ))}
-              <th aria-label="open" />
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((s) => {
-              const down = s.status === 'down';
-              return (
-                <tr
-                  key={s.id}
-                  className={down ? 'is-down' : ''}
-                  onClick={() => setModalId(s.id)}
-                >
-                  <td>
-                    <div className="sname">
-                      <span className="dot" style={{ background: statusColor(s.status) }} />
-                      {s.name}
-                    </div>
-                    <div className="shost">{s.host}</div>
-                  </td>
-                  <td className="mono">
-                    {s.mgmtIp}
-                    {s.mgmtVia && <span className="ts-chip">{s.mgmtVia}</span>}
-                  </td>
-                  <td><Pct value={s.cpu} /></td>
-                  <td><Pct value={s.ram} /></td>
-                  <td><Pct value={s.disk} /></td>
-                  <td className="nodes-cell">
-                    {down ? (
-                      <span className="nil">{s.nodes.length} · {s.nodes.map((n) => n.label).join(' ')}</span>
-                    ) : (
-                      <>
-                        <span className="ncount">{s.nodes.length}</span>
-                        <span className="nlist">
-                          {' · '}
-                          {s.nodes.slice(0, 4).map((n) => n.label.replace(/^vm-/, '')).join(' ')}
-                          {s.nodes.length > 4 ? ` +${s.nodes.length - 4}` : ''}
-                        </span>
-                      </>
-                    )}
-                  </td>
-                  <td>
-                    <div className="badges">
-                      {s.netBadges.map((b) => (
-                        <button
-                          key={b.label}
-                          type="button"
-                          className={`nbadge${b.net === 'tailnet' ? ' accent' : ''}${netFilter === b.net ? ' on' : ''}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setNetFilter((f) => (f === b.net ? null : b.net));
-                          }}
-                        >
-                          {b.label}
-                        </button>
-                      ))}
-                    </div>
-                  </td>
-                  <td className={`uptime${down ? ' crit' : ''}`}>
-                    {down ? `down ${s.downFor}` : s.uptime}
-                  </td>
-                  <td className="chevron">›</td>
+      {!detail && (
+        <TileRow>
+            <Tile label="hosts" value={counts.all} hint={`${counts.up} up · ${counts.warning} warn · ${counts.down} down`} />
+            <Tile label="nodes" value={nodeTotal} hint="services across all hosts" />
+            <Tile label="avg cpu" value={`${summary?.avgCpu ?? '—'}%`} hint={`avg ram ${summary?.avgRam ?? '—'}%`} />
+            <Tile
+              label="fullest disk"
+              value={worst ? `${worst.disk}%` : '—'}
+              tone={worst && worst.disk >= 85 ? DOWN : undefined}
+              hint={worst?.name}
+            />
+            <Tile
+              label="alerts"
+              value={summary?.alerts?.length ?? 0}
+              tone={summary?.alerts?.length ? WARN : undefined}
+              hint="open, all hosts"
+            />
+        </TileRow>
+      )}
+
+      <MorphLayout
+        open={!!detail}
+        table={(
+          <div className="table-wrap">
+            <table className="dtable lg">
+              <thead>
+                <tr>
+                  {COLS.map(([key, label, cls]) => (
+                    <th key={label} className={cls} onClick={() => toggleSort(key)}>
+                      {label}
+                      {key && sort.key === key && (
+                        <span className="sort-arrow">{sort.dir === 1 ? ' ▲' : ' ▼'}</span>
+                      )}
+                    </th>
+                  ))}
+                  <th aria-label="open" />
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-        <div className="table-foot">
-          click row → server detail&nbsp;&nbsp;&nbsp;columns sortable&nbsp;&nbsp;&nbsp;badges filter by network
-        </div>
-      </div>
+              </thead>
+              <tbody>
+                {rows.map((s) => {
+                  const down = s.status === 'down';
+                  return (
+                    <tr
+                      key={s.id}
+                      className={down ? 'is-down' : ''}
+                      title="open this host"
+                      onClick={() => openServer(s.id)}
+                    >
+                      <td>
+                        <div className="sname">
+                          <span className="dot" style={{ background: statusColor(s.status) }} />
+                          {s.name}
+                        </div>
+                        <div className="shost">{s.host}</div>
+                      </td>
+                      <td className="mono">
+                        {s.mgmtIp}
+                        {s.mgmtVia && <span className="ts-chip">{s.mgmtVia}</span>}
+                      </td>
+                      <td className="mob-hide"><Pct value={s.cpu} /></td>
+                      <td className="mob-hide"><Pct value={s.ram} /></td>
+                      <td className="mob-hide"><Pct value={s.disk} /></td>
+                      <td className="nodes-cell mob-hide">
+                        {down ? (
+                          <span className="nil">{s.nodes.length} · {s.nodes.map((n) => n.label).join(' ')}</span>
+                        ) : (
+                          <>
+                            <span className="ncount">{s.nodes.length}</span>
+                            <span className="nlist">
+                              {' · '}
+                              {s.nodes.slice(0, 4).map((n) => n.label.replace(/^vm-/, '')).join(' ')}
+                              {s.nodes.length > 4 ? ` +${s.nodes.length - 4}` : ''}
+                            </span>
+                          </>
+                        )}
+                      </td>
+                      <td className="mob-hide">
+                        <div className="badges">
+                          {s.netBadges.map((b) => (
+                            <button
+                              key={b.label}
+                              type="button"
+                              className={`nbadge${b.net === 'tailnet' ? ' accent' : ''}${netFilter === b.net ? ' on' : ''}`}
+                              title="filter by this network · ctrl+click opens the network page"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isDirect(e)) {
+                                  go(netPath(b.net));
+                                  return;
+                                }
+                                setNetFilter((f) => (f === b.net ? null : b.net));
+                              }}
+                            >
+                              {b.label}
+                            </button>
+                          ))}
+                        </div>
+                      </td>
+                      <td className={`uptime${down ? ' crit' : ''}`}>
+                        {down ? `down ${s.downFor}` : s.uptime}
+                      </td>
+                      <td className="chevron">›</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div className="table-foot">
+              click a host → its page&nbsp;&nbsp;&nbsp;columns sortable&nbsp;&nbsp;&nbsp;badges filter by network · ctrl+click opens the network
+            </div>
+          </div>
+        )}
+        rail={(
+          <div className="rail">
+            <button type="button" className="rail-back" onClick={closeDetail}>
+              ‹ all hosts
+            </button>
+            <MasterList
+              groups={groups}
+              selectedId={detail?.id}
+              onSelect={(id) => openServer(id)}
+            />
+          </div>
+        )}
+        detail={detail && (
+          <ServerDetail
+            server={detail}
+            nets={netsById}
+            records={dom?.records ?? []}
+            highlightNode={nodeParam}
+            onOpenNode={(serverId, chipId, nodeId, e) => {
+              if (isDirect(e)) {
+                go(servicePath(serverId, nodeId ?? primaryNode(detail, chipId)));
+                return;
+              }
+              setModal({ kind: 'node', serverId, chipId });
+            }}
+            onOpenIface={(serverId, ifaceId) => setModal({ kind: 'iface', serverId, ifaceId })}
+            onClose={closeDetail}
+          />
+        )}
+      />
 
-      {modal && (
-        <ServerModal
-          server={modal}
+      {modal?.kind === 'node' && modalServer && modalChip && (
+        <NodeModal
+          server={modalServer}
+          chip={modalChip}
           nets={netsById}
-          context="servers"
-          onClose={() => setModalId(null)}
+          onOpenServer={(id) => setModal({ kind: 'server', id })}
+          onClose={() => setModal(null)}
         />
+      )}
+      {modal?.kind === 'iface' && modalServer && modalIface && (
+        <MiniModal onClose={() => setModal(null)}>
+          <InterfacePanel
+            server={modalServer}
+            iface={modalIface}
+            net={netsById[modalIface.net]}
+            asCard
+            onClose={() => setModal(null)}
+          />
+        </MiniModal>
       )}
     </div>
   );

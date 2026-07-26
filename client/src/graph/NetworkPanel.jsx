@@ -1,8 +1,8 @@
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { serverPath, netPath, useGo } from '../nav.js';
 
 export default function NetworkPanel({ net, edges, serversById, style, onClose }) {
-  const navigate = useNavigate();
+  const go = useGo();
   const members = edges
     .filter((e) => e.net === net.id)
     .map((e) => {
@@ -10,6 +10,7 @@ export default function NetworkPanel({ net, edges, serversById, style, onClose }
       const iface = s?.interfaces.find((i) => i.id === e.iface);
       return {
         key: e.id,
+        serverId: e.server,
         name: e.node ? `${s?.name} · ${e.node}` : s?.name,
         ip: iface?.ips?.[0]?.ip ?? '—',
         rx: iface?.rx,
@@ -39,7 +40,13 @@ export default function NetworkPanel({ net, edges, serversById, style, onClose }
 
       <div className="panel-sect">members · {members.length}</div>
       {members.map((m) => (
-        <div key={m.key} className={`panel-row${m.down ? ' tone-down' : ''}`}>
+        <button
+          key={m.key}
+          type="button"
+          className={`panel-row as-btn${m.down ? ' tone-down' : ''}`}
+          title="open this host's page"
+          onClick={() => go(serverPath(m.serverId))}
+        >
           <span className={`member${m.down ? ' down' : ''}`}>{m.name}</span>
           <span className="member-ip">
             {m.ip}
@@ -47,7 +54,7 @@ export default function NetworkPanel({ net, edges, serversById, style, onClose }
               <span className="member-traffic"> ▲{m.tx} ▼{m.rx}</span>
             )}
           </span>
-        </div>
+        </button>
       ))}
 
       <div className="panel-note">
@@ -58,7 +65,7 @@ export default function NetworkPanel({ net, edges, serversById, style, onClose }
       <button
         type="button"
         className="panel-openlink"
-        onClick={() => navigate(`/networks?net=${net.id}`)}
+        onClick={() => go(netPath(net.id))}
       >
         open network page →
       </button>

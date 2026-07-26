@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useApi } from '../api.js';
 import GraphCanvas from '../graph/GraphCanvas.jsx';
 import ServerModal from '../components/ServerModal.jsx';
@@ -15,6 +16,9 @@ const FILTERS = [
 export default function OverviewPage() {
   const { data: topo } = useApi('/api/topology');
   const { data: srv } = useApi('/api/servers');
+  // ?focus=<host> — where "show on map" from any other page lands
+  const [params, setParams] = useSearchParams();
+  const focusId = params.get('focus');
   const [filter, setFilter] = useState('all');
   const [panel, setPanel] = useState(null);
   // modal: null | { kind: 'server', id } | { kind: 'node', serverId, chipId }
@@ -50,11 +54,15 @@ export default function OverviewPage() {
     : null;
   const modalChip = modal?.kind === 'node'
     ? modalServer?.chips.find((c) => c.id === modal.chipId)
+      ?? modalServer?.chips.find((c) => (c.nodes ?? []).includes(modal.chipId))
     : null;
+
+  const focusServer = focusId ? servers.find((s) => s.id === focusId) : null;
 
   const subtitle = () => {
     if (modalChip) return `full mesh · ${modalChip.label} @ ${modalServer.name} selected`;
     if (modalServer) return `full mesh · ${modalServer.name} selected`;
+    if (focusServer) return `full mesh · focused on ${focusServer.name}`;
     return `full mesh · updated ${tick}s ago`;
   };
 
@@ -79,6 +87,16 @@ export default function OverviewPage() {
           <div className="page-sub">{subtitle()}</div>
         </div>
         <div className="chips">
+          {focusServer && (
+            <button
+              type="button"
+              className="chip active"
+              title="clear the focus"
+              onClick={() => setParams({}, { replace: true })}
+            >
+              focus: {focusServer.name} ×
+            </button>
+          )}
           {FILTERS.map(([id, label]) => (
             <button
               key={id}
@@ -96,7 +114,7 @@ export default function OverviewPage() {
         topology={topo}
         servers={servers}
         filter={filter}
-        selectedId={modalServer?.id ?? null}
+        selectedId={modalServer?.id ?? focusServer?.id ?? null}
         panel={panel}
         onPanel={setPanel}
         onSelectServer={(id) => {
@@ -114,6 +132,7 @@ export default function OverviewPage() {
           server={modalServer}
           nets={netsById}
           context="overview"
+          onOpenNode={(serverId, chipId) => setModal({ kind: 'node', serverId, chipId })}
           onClose={() => setModal(null)}
         />
       )}

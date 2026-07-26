@@ -623,6 +623,254 @@ export const edges = [
     label: '192.168.80.196', traffic: 2.4 },
 ];
 
+// ---- dns zones -------------------------------------------------------------
+// a zone is a name space someone answers for: a public zone at a registrar,
+// the tailnet's magicdns, or a split-horizon zone served on the lan.
+// kind drives the grouping on the domains page.
+export const zones = [
+  {
+    id: 'nyx.dev',
+    name: 'nyx.dev',
+    kind: 'public',
+    color: '#e0a458',
+    registrar: 'porkbun',
+    renews: '2027-03-04',
+    dns: 'cloudflare',
+    ns: ['ada.ns.cloudflare.com', 'bob.ns.cloudflare.com'],
+    dnssec: true,
+    note: 'main public zone · origins are hidden behind the cf proxy unless a record is marked direct',
+  },
+  {
+    id: 'jnsm.eu',
+    name: 'jnsm.eu',
+    kind: 'public',
+    color: '#e0a458',
+    registrar: 'netcup',
+    renews: '2027-01-19',
+    dns: 'cloudflare',
+    ns: ['carol.ns.cloudflare.com', 'dan.ns.cloudflare.com'],
+    dnssec: false,
+    note: 'private services published from the dorm nas — the request path always ends on ug1',
+  },
+  {
+    id: 'nyx-mesh.ts.net',
+    name: 'nyx-mesh.ts.net',
+    kind: 'magicdns',
+    color: '#2fd6a5',
+    dns: 'tailscale magicdns',
+    ns: ['100.100.100.100'],
+    dnssec: false,
+    note: 'names are handed out by the tailnet itself · no registrar, no certificates, no public exposure',
+  },
+  {
+    id: 'nyx.lan',
+    name: 'nyx.lan',
+    kind: 'internal',
+    color: '#53d3e0',
+    dns: 'pihole + unbound @ hermes',
+    ns: ['192.168.10.53'],
+    dnssec: false,
+    note: 'split dns · answered on the home lan by hermes and inside the tailnet by coredns @ ug1',
+  },
+];
+
+// ---- dns records -----------------------------------------------------------
+// pure facts per record: where it points, which interface answers it and what
+// terminates the tls. `via` names an extra hop between the record and its
+// origin (proxy, tunnel), `state` marks a record whose target is unhealthy.
+export const records = [
+  // ---- nyx.dev ----
+  {
+    id: 'nyx-apex', zone: 'nyx.dev', name: '@', fqdn: 'nyx.dev', type: 'A',
+    value: '157.90.214.12', ttl: 'auto', proxied: true,
+    server: 'atlas', iface: 'eth0', node: 'trf', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-10-02' },
+    note: 'landing page · traefik router web-main',
+  },
+  {
+    id: 'nyx-www', zone: 'nyx.dev', name: 'www', fqdn: 'www.nyx.dev', type: 'CNAME',
+    value: 'nyx.dev', ttl: 'auto', proxied: true,
+    server: 'atlas', iface: 'eth0', node: 'trf', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-10-02' },
+  },
+  {
+    id: 'nyx-git', zone: 'nyx.dev', name: 'git', fqdn: 'git.nyx.dev', type: 'A',
+    value: '157.90.214.12', ttl: 'auto', proxied: true,
+    server: 'atlas', iface: 'eth0', node: 'gta', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-09-12' },
+    note: 'ssh clone only over tailnet — the proxy hides the origin',
+  },
+  {
+    id: 'nyx-auth', zone: 'nyx.dev', name: 'auth', fqdn: 'auth.nyx.dev', type: 'A',
+    value: '157.90.214.12', ttl: 'auto', proxied: true,
+    server: 'atlas', iface: 'eth0', node: 'ath', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-09-12' },
+    note: 'sso for every other public service in this zone',
+  },
+  {
+    id: 'nyx-status', zone: 'nyx.dev', name: 'status', fqdn: 'status.nyx.dev', type: 'A',
+    value: '157.90.214.88', ttl: '300', proxied: false,
+    server: 'atlas', iface: 'eth0', node: 'kum', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-09-30' },
+    note: 'on the floating ip and deliberately not proxied — must stay up when cf is the problem',
+  },
+  {
+    id: 'nyx-photos', zone: 'nyx.dev', name: 'photos', fqdn: 'photos.nyx.dev', type: 'A',
+    value: '65.108.33.7', ttl: 'auto', proxied: true,
+    server: 'hyperion', iface: 'eth0', node: 'imc', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-10-11' },
+  },
+  {
+    id: 'nyx-s3', zone: 'nyx.dev', name: 's3', fqdn: 's3.nyx.dev', type: 'A',
+    value: '65.108.33.7', ttl: '300', proxied: false,
+    server: 'hyperion', iface: 'eth0', node: 'min', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-08-05' },
+    note: 'direct: s3 clients need the real origin for presigned urls',
+  },
+  {
+    id: 'nyx-k8s', zone: 'nyx.dev', name: '*.k8s', fqdn: '*.k8s.nyx.dev', type: 'A',
+    value: '65.108.33.7', ttl: 'auto', proxied: false,
+    server: 'hyperion', iface: 'eth0', node: 'ing', net: 'hetzner',
+    tls: { issuer: "let's encrypt · dns-01", expires: '2026-09-08' },
+    note: 'wildcard · every k3s ingress host lands here',
+  },
+  {
+    id: 'nyx-cloud', zone: 'nyx.dev', name: 'cloud', fqdn: 'cloud.nyx.dev', type: 'A',
+    value: '152.89.104.51', ttl: '300', proxied: false,
+    server: 'helios', iface: 'eth0', node: 'ncl', net: 'netcup',
+    tls: { issuer: "let's encrypt", expires: '2026-09-21' },
+    note: 'direct: webdav + large uploads do not survive the proxy limits',
+  },
+  {
+    id: 'nyx-flows', zone: 'nyx.dev', name: 'flows', fqdn: 'flows.nyx.dev', type: 'A',
+    value: '152.89.104.51', ttl: 'auto', proxied: true,
+    server: 'helios', iface: 'eth0', node: 'n8n', net: 'netcup',
+    tls: { issuer: "let's encrypt", expires: '2026-09-21' },
+  },
+  {
+    id: 'nyx-backup', zone: 'nyx.dev', name: 'backup', fqdn: 'backup.nyx.dev', type: 'A',
+    value: '194.36.88.201', ttl: '300', proxied: false,
+    server: 'janus', iface: 'eth0', node: 'bkp', net: 'contabo',
+    state: 'down',
+    tls: { issuer: "let's encrypt", expires: '2026-08-28' },
+    note: 'points at an unreachable host since 21:36 · restic repo endpoint',
+  },
+  {
+    id: 'nyx-mx', zone: 'nyx.dev', name: '@', fqdn: 'nyx.dev', type: 'MX',
+    value: 'mx1.mailbox.org · prio 10', ttl: 'auto', proxied: false,
+    note: 'mail is external — nothing in this infrastructure receives mail',
+  },
+  {
+    id: 'nyx-spf', zone: 'nyx.dev', name: '@', fqdn: 'nyx.dev', type: 'TXT',
+    value: 'v=spf1 include:mailbox.org -all', ttl: 'auto', proxied: false,
+  },
+  {
+    id: 'nyx-dmarc', zone: 'nyx.dev', name: '_dmarc', fqdn: '_dmarc.nyx.dev', type: 'TXT',
+    value: 'v=DMARC1; p=quarantine; rua=mailto:dmarc@nyx.dev', ttl: 'auto', proxied: false,
+  },
+
+  // ---- jnsm.eu ----
+  {
+    id: 'jnsm-apex', zone: 'jnsm.eu', name: '@', fqdn: 'jnsm.eu', type: 'A',
+    value: '157.90.214.12', ttl: 'auto', proxied: true,
+    server: 'atlas', iface: 'eth0', node: 'trf', net: 'hetzner',
+    tls: { issuer: "let's encrypt", expires: '2026-10-02' },
+  },
+  {
+    id: 'jnsm-mealie', zone: 'jnsm.eu', name: 'mealie', fqdn: 'mealie.jnsm.eu', type: 'A',
+    value: '157.90.214.12', ttl: 'auto', proxied: true,
+    server: 'ug1', iface: 'lan', node: 'mea', net: 'dorm',
+    via: 'atlas · traefik → tailnet → ts-nginx-proxy-net',
+    tls: { issuer: "let's encrypt", expires: '2026-08-14' },
+    note: 'the nas has no public ip — the request rides the tailnet into the dorm',
+  },
+  {
+    id: 'jnsm-wiki', zone: 'jnsm.eu', name: 'wiki', fqdn: 'wiki.jnsm.eu', type: 'CNAME',
+    value: 'wikijs-server.nyx-mesh.ts.net', ttl: 'auto', proxied: false,
+    server: 'ug1', iface: 'ts1', node: 'wiki', net: 'tailnet',
+    note: 'resolves publicly, reachable only from inside the tailnet — by design',
+  },
+
+  // ---- nyx-mesh.ts.net (magicdns) ----
+  {
+    id: 'md-atlas', zone: 'nyx-mesh.ts.net', name: 'atlas', fqdn: 'atlas.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.4',
+    server: 'atlas', iface: 'ts0', net: 'tailnet',
+  },
+  {
+    id: 'md-hyperion', zone: 'nyx-mesh.ts.net', name: 'hyperion', fqdn: 'hyperion.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.7',
+    server: 'hyperion', iface: 'ts0', net: 'tailnet',
+  },
+  {
+    id: 'md-helios', zone: 'nyx-mesh.ts.net', name: 'helios', fqdn: 'helios.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.9',
+    server: 'helios', iface: 'ts0', net: 'tailnet',
+  },
+  {
+    id: 'md-kratos', zone: 'nyx-mesh.ts.net', name: 'kratos', fqdn: 'kratos.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.12',
+    server: 'kratos', iface: 'ts0', net: 'tailnet',
+    note: 'proxmox ui :8006 is reachable on this name only',
+  },
+  {
+    id: 'md-hermes', zone: 'nyx-mesh.ts.net', name: 'hermes', fqdn: 'hermes.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.15',
+    server: 'hermes', iface: 'ts0', net: 'tailnet',
+  },
+  {
+    id: 'md-media', zone: 'nyx-mesh.ts.net', name: 'media', fqdn: 'media.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.101.1.21',
+    server: 'kratos', iface: 'ts1', node: 'media', net: 'tailnet',
+    note: 'own ts identity inside vm-media · exposes jellyfin :8096 only',
+  },
+  {
+    id: 'md-wiki', zone: 'nyx-mesh.ts.net', name: 'wikijs-server',
+    fqdn: 'wikijs-server.nyx-mesh.ts.net', type: 'magicdns', value: '100.64.1.3',
+    server: 'ug1', iface: 'ts1', node: 'wiki', net: 'tailnet',
+    note: 'sidecar identity · the wiki container shares its netns',
+  },
+  {
+    id: 'md-dns', zone: 'nyx-mesh.ts.net', name: 'dns-server',
+    fqdn: 'dns-server.nyx-mesh.ts.net', type: 'magicdns', value: '100.64.1.4',
+    server: 'ug1', iface: 'ts2', node: 'dns', net: 'tailnet',
+    note: 'coredns :53 for the whole tailnet',
+  },
+  {
+    id: 'md-ug1', zone: 'nyx-mesh.ts.net', name: 'ug1', fqdn: 'ug1.nyx-mesh.ts.net',
+    type: 'magicdns', value: '100.64.1.2',
+    server: 'ug1', iface: 'ts0', net: 'tailnet',
+    state: 'down',
+    note: 'host key expired · the name stays, nothing answers on it',
+  },
+
+  // ---- nyx.lan (split horizon) ----
+  {
+    id: 'lan-dns', zone: 'nyx.lan', name: 'dns', fqdn: 'dns.nyx.lan', type: 'A',
+    value: '192.168.10.53', ttl: '60', proxied: false,
+    server: 'hermes', iface: 'lan', node: 'dns', net: 'lan',
+    note: 'the resolver answering this zone answers for itself as well',
+  },
+  {
+    id: 'lan-pve', zone: 'nyx.lan', name: 'pve', fqdn: 'pve.nyx.lan', type: 'A',
+    value: '192.168.10.20', ttl: '60', proxied: false,
+    server: 'kratos', iface: 'lan', net: 'lan',
+  },
+  {
+    id: 'lan-jelly', zone: 'nyx.lan', name: 'jelly', fqdn: 'jelly.nyx.lan', type: 'CNAME',
+    value: 'media.nyx-mesh.ts.net', ttl: '60', proxied: false,
+    server: 'kratos', iface: 'ts1', node: 'media', net: 'tailnet',
+    note: 'lan name, tailnet target — works from both sides',
+  },
+  {
+    id: 'lan-nas', zone: 'nyx.lan', name: 'nas', fqdn: 'nas.nyx.lan', type: 'A',
+    value: '192.168.80.196', ttl: '60', proxied: false,
+    server: 'ug1', iface: 'lan', net: 'dorm',
+    via: 'coredns @ ug1 (tailnet clients)',
+    note: 'only answered inside the dorm lan and by coredns for tailnet clients',
+  },
+];
+
 // ---- summary ---------------------------------------------------------------
 export function summary() {
   const up = servers.filter((s) => s.status === 'up').length;

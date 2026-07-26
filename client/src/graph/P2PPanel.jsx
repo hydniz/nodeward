@@ -1,8 +1,10 @@
 import React from 'react';
+import { serverPath, netPath, useGo } from '../nav.js';
 
 // point-to-point vpn link panel: both endpoints, per-side traffic and
 // everything routed over the tunnel
 export default function P2PPanel({ link, serversById, style, onClose }) {
+  const go = useGo();
   const sa = serversById[link.a.server];
   const sb = serversById[link.b.server];
   const ia = sa?.interfaces.find((i) => i.id === link.a.iface);
@@ -32,13 +34,19 @@ export default function P2PPanel({ link, serversById, style, onClose }) {
       </div>
 
       {[[sa, ia], [sb, ib]].map(([s, i]) => (
-        <div key={s.id} className="panel-row">
+        <button
+          key={s.id}
+          type="button"
+          className="panel-row as-btn"
+          title="open this host's page"
+          onClick={() => go(serverPath(s.id))}
+        >
           <span className="member">{s.name}</span>
           <span className="member-ip">
             {i.ips[0]?.ip}
             <span className="member-traffic"> ▲{i.tx} ▼{i.rx}</span>
           </span>
-        </div>
+        </button>
       ))}
 
       <div className="panel-stats">
@@ -58,6 +66,14 @@ export default function P2PPanel({ link, serversById, style, onClose }) {
       )}
 
       {ia.note && <div className="panel-note">{ia.note}</div>}
+
+      <button
+        type="button"
+        className="panel-openlink"
+        onClick={() => go(netPath(link.net))}
+      >
+        open network page →
+      </button>
     </div>
   );
 }

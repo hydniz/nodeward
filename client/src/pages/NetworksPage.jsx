@@ -2,6 +2,14 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useApi } from '../api.js';
 import ServerModal from '../components/ServerModal.jsx';
+import NodeModal from '../components/NodeModal.jsx';
+import {
+  PageHead, Chips, FilterRow, Tile, TileRow, Sect, MasterList, DetailHead,
+  KeyRow, Note,
+} from '../components/ui.jsx';
+import {
+  serverPath, zonePath, isDirect, useGo,
+} from '../nav.js';
 
 const UP = '#3ecf9a';
 const DOWN = '#e0564a';
@@ -94,6 +102,18 @@ function buildModel(topo, servers) {
       if (iface.note && !notes.includes(iface.note)) notes.push(iface.note);
     });
 
+    // trunks (R9) are a property of the network too: a host that joins with
+    // three interfaces is a fact worth naming on this page
+    const trunks = (topo.bundles ?? [])
+      .filter((b) => b.net === n.id)
+      .map((b) => ({
+        id: b.id,
+        serverId: b.server,
+        server: serversById[b.server]?.name ?? b.server,
+        count: b.members.length,
+        traffic: b.traffic,
+      }));
+
     const rx = members.reduce((a, m) => a + m.rx, 0);
     const tx = members.reduce((a, m) => a + m.tx, 0);
     const downCount = members.filter((m) => m.down).length;
@@ -109,6 +129,7 @@ function buildModel(topo, servers) {
       routed,
       facts,
       notes,
+      trunks,
     };
   });
 
@@ -122,27 +143,26 @@ function buildModel(topo, servers) {
   return { nets, memberships };
 }
 
-function Tile({ label, value, tone }) {
-  return (
-    <div className="tile">
-      <div className="tile-label">{label}</div>
-      <div className="tile-value" style={tone ? { color: tone } : undefined}>{value}</div>
-    </div>
-  );
-}
-
 export default function NetworksPage() {
   const { data: topo } = useApi('/api/topology');
   const { data: srv } = useApi('/api/servers');
+  const { data: dom } = useApi('/api/domains');
   const [params, setParams] = useSearchParams();
+  const go = useGo();
   const [filter, setFilter] = useState('all');
-  const [modalId, setModalId] = useState(null);
+  // mini overview: server | node
+  const [modal, setModal] = useState(null);
 
   useEffect(() => {
-    const onKey = (e) => e.key === 'Escape' && setModalId(null);
+    const onKey = (e) => e.key === 'Escape' && setModal(null);
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+
+  // which zone answers for a name — turns every dns line into a link
+  const zoneOf = (fqdn) => dom?.zones.find(
+    (z) => fqdn === z.id || fqdn.endsWith(`.${z.id}`),
+  )?.id;
 
   const model = useMemo(
     () => (topo && srv ? buildModel(topo, srv.servers) : null),
@@ -156,93 +176,71 @@ export default function NetworksPage() {
   if (!model) {
     return (
       <div className="page">
-        <header className="page-head">
-          <div>
-            <h1>Networks</h1>
-            <div className="page-sub">connecting…</div>
-          </div>
-        </header>
+        <PageHead title="Networks" sub="connecting…" />
       </div>
     );
   }
 
   const listed = model.nets.filter((n) => filter === 'all' || n.group === filter);
   const selected = model.nets.find((n) => n.id === params.get('net')) ?? listed[0] ?? model.nets[0];
-  const modalServer = srv.servers.find((s) => s.id === modalId);
+  const modalServer = modal
+    ? srv.servers.find((s) => s.id === (modal.kind === 'server' ? modal.id : modal.serverId))
+    : null;
+  const modalChip = modal?.kind === 'node'
+    ? modalServer?.chips.find((c) => c.id === modal.chipId)
+      ?? modalServer?.chips.find((c) => (c.nodes ?? []).includes(modal.chipId))
+    : null;
   const maxMemberTraffic = Math.max(1, ...selected.members.map((m) => m.rx + m.tx));
+  const downTotal = model.nets.reduce((a, n) => a + n.downCount, 0);
+
+  const groups = GROUPS.map(([g, label]) => ({
+    id: g,
+    label,
+    items: listed.filter((n) => n.group === g).map((n) => ({
+      id: n.id,
+      name: n.name,
+      kind: n.kind,
+      color: n.color,
+      count: n.members.length,
+      state: n.downCount ? `${n.downCount} down` : `▲${n.tx} ▼${n.rx}`,
+      bad: n.downCount > 0,
+    })),
+  }));
 
   return (
     <div className="page scroll">
-      <header className="page-head">
-        <div>
-          <h1>Networks</h1>
-          <div className="page-sub">
-            {model.nets.length} networks · {model.memberships} memberships
-          </div>
-        </div>
-        <div className="chips">
-          {FILTERS.map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              className={`chip${filter === id ? ' active' : ''}`}
-              onClick={() => setFilter(id)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      </header>
+      <PageHead
+        title="Networks"
+        sub={`${model.nets.length} networks · ${model.memberships} memberships`}
+      />
 
-      <div className="networks-layout">
-        {/* ---- left: network list ---- */}
-        <div className="netlist">
-          {GROUPS.filter(([g]) => listed.some((n) => n.group === g)).map(([g, label]) => (
-            <React.Fragment key={g}>
-              <div className="netlist-group">{label}</div>
-              {listed.filter((n) => n.group === g).map((n) => (
-                <button
-                  key={n.id}
-                  type="button"
-                  className={`netlist-item${selected.id === n.id ? ' active' : ''}`}
-                  style={selected.id === n.id ? { borderLeftColor: n.color } : undefined}
-                  onClick={() => setParams({ net: n.id }, { replace: true })}
-                >
-                  <span className="nl-glyph" style={{ background: n.color }} />
-                  <span className="nl-text">
-                    <span className="nl-name">{n.name}</span>
-                    <span className="nl-kind">{n.kind}</span>
-                  </span>
-                  <span className="nl-meta">
-                    <span className="nl-count">{n.members.length}</span>
-                    <span className={`nl-state${n.downCount ? ' bad' : ''}`}>
-                      {n.downCount ? `${n.downCount} down` : `▲${n.tx} ▼${n.rx}`}
-                    </span>
-                  </span>
-                </button>
-              ))}
-            </React.Fragment>
-          ))}
-        </div>
+      <FilterRow meta={`${downTotal ? `${downTotal} member links down` : 'all member links up'}`}>
+        <Chips options={FILTERS} value={filter} onChange={setFilter} />
+      </FilterRow>
 
-        {/* ---- right: network detail ---- */}
-        <div className="netdetail">
-          <div className="nd-head">
-            <span className="nd-glyph" style={{ color: selected.color }}>
-              {selected.virtual ? '⇄' : '☁'}
-            </span>
-            <h2>{selected.name}</h2>
-            {selected.cidr && <span className="mchip">{selected.cidr}</span>}
-            <span className="mchip">{selected.kind}</span>
-            {selected.sub && !selected.cidr && <span className="mchip">{selected.sub}</span>}
-            <span className="nd-traffic">
-              <span className="tx">▲{selected.tx}</span>{' '}
-              <span className="rx">▼{selected.rx}</span>{' '}
-              <span className="nd-unit">MB/s</span>
-            </span>
-          </div>
+      <div className="detail-layout">
+        <MasterList
+          groups={groups}
+          selectedId={selected.id}
+          onSelect={(id) => setParams({ net: id }, { replace: true })}
+        />
 
-          <div className="nd-tiles">
+        <section className="detailcard">
+          <DetailHead
+            glyph={selected.virtual ? '⇄' : '☁'}
+            color={selected.color}
+            title={selected.name}
+            chips={[selected.cidr, selected.kind, !selected.cidr ? selected.sub : null]}
+            right={(
+              <>
+                <span className="tx">▲{selected.tx}</span>{' '}
+                <span className="rx">▼{selected.rx}</span>{' '}
+                <span className="dh-unit">MB/s</span>
+              </>
+            )}
+          />
+
+          <TileRow>
             <Tile label="members" value={selected.members.length} />
             <Tile label="tx total" value={`${selected.tx} MB/s`} />
             <Tile label="rx total" value={`${selected.rx} MB/s`} />
@@ -251,10 +249,11 @@ export default function NetworksPage() {
               value={selected.downCount ? `${selected.downCount} down` : 'healthy'}
               tone={selected.downCount ? DOWN : UP}
             />
-          </div>
+          </TileRow>
 
-          <div className="nd-sect">members · {selected.members.length}</div>
-          <table className="ntable">
+          <Sect>members · {selected.members.length}</Sect>
+          <div className="table-scroll">
+            <table className="dtable">
             <thead>
               <tr>
                 <th>member</th>
@@ -271,21 +270,28 @@ export default function NetworksPage() {
                 <tr
                   key={m.key}
                   className={m.down ? 'is-down' : ''}
-                  onClick={() => setModalId(m.serverId)}
+                  title="host overview · ctrl+click opens the host page"
+                  onClick={(e) => {
+                    if (isDirect(e)) {
+                      go(serverPath(m.serverId));
+                      return;
+                    }
+                    setModal({ kind: 'server', id: m.serverId });
+                  }}
                 >
                   <td>
-                    <span className="nt-member">
+                    <span className="t-name">
                       <span
                         className="dot sm"
                         style={{ background: m.down ? DOWN : UP }}
                       />
                       {m.name}
-                      {m.nodeLabel && <span className="nt-node"> · {m.nodeLabel}</span>}
+                      {m.nodeLabel && <span className="t-node"> · {m.nodeLabel}</span>}
                     </span>
                   </td>
-                  <td className="nt-iface">{m.iface.title}</td>
+                  <td className="t-iface">{m.iface.title}</td>
                   <td className="mono">{m.ip}</td>
-                  <td className="nt-details">{m.details}</td>
+                  <td className="t-dim">{m.details}</td>
                   <td className="num tx">{m.down ? '—' : m.tx}</td>
                   <td className="num rx">{m.down ? '—' : m.rx}</td>
                   <td>
@@ -301,76 +307,103 @@ export default function NetworksPage() {
                   </td>
                 </tr>
               ))}
-            </tbody>
-          </table>
+              </tbody>
+            </table>
+          </div>
+
+          {selected.trunks.length > 0 && (
+            <>
+              <Sect>bundled joins · drawn as one trunk on the map</Sect>
+              {selected.trunks.map((t) => (
+                <KeyRow
+                  key={t.id}
+                  l={t.server}
+                  owner={`${t.count} interfaces`}
+                  r={`${t.traffic} MB/s`}
+                  tone="accent"
+                  title="open this host's page"
+                  onClick={() => go(serverPath(t.serverId))}
+                />
+              ))}
+            </>
+          )}
 
           {selected.dns.length > 0 && (
             <>
-              <div className="nd-sect">dns records terminating in this network</div>
+              <Sect>dns records terminating in this network</Sect>
               {selected.dns.map((d) => (
-                <div key={d.host} className={`nd-row tone-${d.tone || 'dim'}`}>
-                  <span className="nd-l">{d.host}</span>
-                  <span className="nd-owner">via {d.via}</span>
-                  <span className="r">{d.status}</span>
-                </div>
+                <KeyRow
+                  key={d.host}
+                  l={d.host}
+                  owner={`via ${d.via}`}
+                  r={d.status}
+                  tone={d.tone}
+                  title="open the zone this name belongs to"
+                  onClick={() => go(zonePath(zoneOf(d.host) ?? ''))}
+                />
               ))}
             </>
           )}
 
           {selected.magic.length > 0 && (
             <>
-              <div className="nd-sect">magicdns</div>
+              <Sect>magicdns</Sect>
               {selected.magic.map((m) => (
-                <div key={m.fqdn} className="nd-row">
-                  <span className="nd-l mono">{m.fqdn}</span>
-                  <span className="nd-owner">{m.owner}</span>
-                </div>
+                <KeyRow
+                  key={m.fqdn}
+                  l={m.fqdn}
+                  owner={m.owner}
+                  mono
+                  title="open the magicdns zone"
+                  onClick={() => go(zonePath(zoneOf(m.fqdn) ?? ''))}
+                />
               ))}
             </>
           )}
 
           {selected.routed.length > 0 && (
             <>
-              <div className="nd-sect">routed over this link</div>
+              <Sect>routed over this link</Sect>
               {selected.routed.map((r) => (
-                <div key={r.l} className={`nd-row tone-${r.tone || 'dim'}`}>
-                  <span className="nd-l">{r.l}</span>
-                  <span className="r">{r.r}</span>
-                </div>
+                <KeyRow key={r.l} l={r.l} r={r.r} tone={r.tone} />
               ))}
             </>
           )}
 
           {selected.facts.length > 0 && (
             <>
-              <div className="nd-sect">interface facts</div>
+              <Sect>interface facts</Sect>
               {selected.facts.map((f) => (
-                <div key={`${f.owner}-${f.l}`} className={`nd-row tone-${f.tone || 'dim'}`}>
-                  <span className="nd-owner">{f.owner}</span>
-                  <span className="nd-l">{f.l}</span>
-                  <span className="r">{f.r}</span>
-                </div>
+                <KeyRow key={`${f.owner}-${f.l}`} l={f.l} owner={f.owner} r={f.r} tone={f.tone} />
               ))}
             </>
           )}
 
           {selected.notes.length > 0 && (
             <>
-              <div className="nd-sect">notes</div>
-              {selected.notes.map((t) => (
-                <div key={t} className="nd-note">{t}</div>
-              ))}
+              <Sect>notes</Sect>
+              {selected.notes.map((t) => <Note key={t}>{t}</Note>)}
             </>
           )}
-        </div>
+        </section>
       </div>
 
-      {modalServer && (
+      {modal?.kind === 'server' && modalServer && (
         <ServerModal
           server={modalServer}
           nets={netsById}
           context="networks"
-          onClose={() => setModalId(null)}
+          onOpenNode={(serverId, chipId) => setModal({ kind: 'node', serverId, chipId })}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal?.kind === 'node' && modalServer && modalChip && (
+        <NodeModal
+          server={modalServer}
+          chip={modalChip}
+          nets={netsById}
+          onOpenServer={(id) => setModal({ kind: 'server', id })}
+          onClose={() => setModal(null)}
         />
       )}
     </div>

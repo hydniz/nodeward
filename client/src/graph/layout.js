@@ -1,11 +1,9 @@
-// re-export of the shared geometry helpers — the server-side auto-layout
-// engine (shared/autoLayout.js) uses the exact same code, so the layout the
-// api computes and what the client renders always agree
+// re-export of the shared geometry helpers the renderer needs. Everything
+// else (endpoints, bends, label boxes) is computed by the server-side
+// auto-layout engine (shared/autoLayout.js) and shipped by the api, so the
+// picture can never differ between two clients.
 export {
   cloudPath,
-  anchorPoint,
-  cloudAnchor,
   edgeGeometry,
-  chipCenters,
   dashDuration,
 } from '../../../shared/graphGeometry.js';

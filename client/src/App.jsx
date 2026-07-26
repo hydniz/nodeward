@@ -4,11 +4,11 @@ import Sidebar from './components/Sidebar.jsx';
 import OverviewPage from './pages/OverviewPage.jsx';
 import ServersPage from './pages/ServersPage.jsx';
 import NetworksPage from './pages/NetworksPage.jsx';
+import DomainsPage from './pages/DomainsPage.jsx';
+import ServicesPage from './pages/ServicesPage.jsx';
 import PlaceholderPage from './pages/PlaceholderPage.jsx';
 
 const placeholders = [
-  ['services', 'Services', 'logical services across hosts, docker networks, sidecars'],
-  ['domains', 'Domains', 'dns records, proxy status, certificates'],
   ['alerts', 'Alerts', 'active + resolved alerts from all agents'],
   ['settings', 'Settings', 'thresholds, polling, appearance'],
   ['integrations', 'Integrations', 'tailscale, cloudflare, hetzner, proxmox'],
@@ -24,6 +24,8 @@ export default function App() {
           <Route path="/" element={<OverviewPage />} />
           <Route path="/servers" element={<ServersPage />} />
           <Route path="/networks" element={<NetworksPage />} />
+          <Route path="/domains" element={<DomainsPage />} />
+          <Route path="/services" element={<ServicesPage />} />
           {placeholders.map(([slug, title, sub]) => (
             <Route
               key={slug}
