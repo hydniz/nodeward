@@ -1,0 +1,19 @@
+{
+  "name": "nodeward",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "nodeward.dev — see your whole server infrastructure at a glance",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client",
+    "start": "NODE_ENV=production node server/src/index.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
