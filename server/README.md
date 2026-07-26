@@ -158,7 +158,8 @@ implementation has to keep:
 | --- | --- | --- |
 | `PORT` | `4001` | http port |
 | `NODE_ENV` | `development` | `production` closes the development shortcuts |
-| `LOG_LEVEL` / `LOG_JSON` | `debug` / off | logging |
+| `LOG_LEVEL` / `LOG_JSON` | `debug` / off | logging (`info`/on in production) |
+| `LOG_DIR` | `server/logs` in production, unset in dev | daily `nodeward-YYYY-MM-DD.log` files (json lines, with `src` = `file:line` of the call) |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres` |
 | `DATABASE_URL` | — | required for `postgres` |
 | `DEMO_DATA` | `true` on memory | serve the fixture inventory |

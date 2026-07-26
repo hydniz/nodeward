@@ -9,6 +9,10 @@
 //   PORT                      http port                        (4001)
 //   NODE_ENV                  development | production | test   (development)
 //   LOG_LEVEL                 debug | info | warn | error       (debug/info)
+//   LOG_JSON                  json lines on the console         (true in prod)
+//   LOG_DIR                   directory for persistent log files
+//                             (server/logs in prod, unset in dev — set it to
+//                             opt in during development)
 //   STORE_DRIVER              memory | postgres                 (memory)
 //   DATABASE_URL              connection string for postgres    (—)
 //   DEMO_DATA                 serve the fixture inventory       (true on memory)
@@ -30,7 +34,12 @@ export type StoreDriver = 'memory' | 'postgres';
 export interface Config {
   env: NodeEnv;
   port: number;
-  log: { level: LogLevel; json: boolean };
+  log: {
+    level: LogLevel;
+    json: boolean;
+    /** daily log files land here; unset → console only. Always set in production. */
+    dir?: string;
+  };
   /** absolute path of the built frontend; served when it exists. */
   clientDist: string;
   store: {
@@ -87,6 +96,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     log: {
       level: oneOf(env.LOG_LEVEL, ['debug', 'info', 'warn', 'error'] as const, production ? 'info' : 'debug'),
       json: bool(env.LOG_JSON, production),
+      // production always persists; development only when LOG_DIR is set
+      ...(env.LOG_DIR
+        ? { dir: path.resolve(env.LOG_DIR) }
+        : production ? { dir: path.resolve(here, '../logs') } : {}),
     },
     clientDist: path.resolve(here, '../../client/dist'),
     store: {
