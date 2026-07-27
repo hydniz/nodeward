@@ -62,6 +62,11 @@ src/
     explore.md          letting people browse the data: grafana against the same
                         postgres (role, views, queries), what nodeward answers
                         itself, csv export, prometheus interop
+    inventory-ingest.md the implemented inventory ingest: validation, ownership
+                        and merge semantics, decisions worth knowing
+    agent-identity.md   how an agent identifies its host (machine-id & friends),
+                        join token vs bearer token vs hostId, docker and native
+                        service discovery, the four service states
 
   modules/              one folder per bounded piece, wired in modules/index.ts
     inventory/          hosts, services, networks, domains + inventory ingest
