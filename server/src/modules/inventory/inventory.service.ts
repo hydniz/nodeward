@@ -1,15 +1,16 @@
 // ---------------------------------------------------------------------------
 // inventory module — the read side of the facts, and the door the agents use
 //
-// Reads are implemented: they project whatever the store holds (today the demo
-// fixture) into the shapes the frontend already consumes.
+// Reads project whatever the store holds (the demo fixture or applied agent
+// reports) into the shapes the frontend already consumes.
 //
-// The write side — applying an inventory report — is a documented seam. It is
-// the first thing to implement once an agent exists, because everything else
-// (topology, services, domains) is derived from it.
+// The write side is `applyReport`: the route has authenticated the agent and
+// pinned the host, the schema has rebuilt the payload field by field — what
+// arrives here is trusted. The service's own job is the one check that needs
+// store knowledge (dropping edges into networks nobody knows) and handing the
+// snapshot to the store.
 // ---------------------------------------------------------------------------
 
-import { notImplemented } from '../../core/errors.ts';
 import type { Logger } from '../../core/logger.ts';
 import type { Store } from '../../store/index.ts';
 import {
@@ -130,30 +131,57 @@ export function createInventoryService(store: Store, log: Logger): InventoryServ
     lastChangedAt: () => store.inventory.lastChangedAt(),
 
     /**
-     * TODO(implement): accept an inventory snapshot from an agent.
+     * Accept a validated inventory snapshot from an agent.
      *
-     * The route has already authenticated the agent and checked that
-     * `report.hostId` is the host it owns. What is left:
+     * How it works:
      *
-     *   1. validate the payload properly (`inventory.schema.ts`) — an agent is
-     *      not a trusted client, and a malformed report must not be able to
-     *      corrupt the graph
-     *   2. normalise: trim ids, lowercase host ids, drop unknown network refs
-     *      (an edge pointing at a network nobody reported is a dangling edge)
-     *   3. `store.inventory.replaceHost(report)` — atomic, snapshot semantics
-     *   4. tell the topology cache to recompute: `topology.invalidate()`
-     *   5. return how much was accepted, so the agent can log it
+     *   1. Collect every network id that will exist after this report — what
+     *      the store already knows plus what the report brings along.
+     *   2. Drop edges pointing at networks outside that set, and say so in the
+     *      log: an edge into a network nobody reported would be a dangling
+     *      line in the graph. Dropping (instead of refusing) keeps a fleet
+     *      bootstrappable — the first agent may reference a mesh whose other
+     *      members simply have not reported yet; its edge appears with their
+     *      first report.
+     *   3. Hand the snapshot to `store.inventory.replaceHost`, which swaps it
+     *      in atomically and stamps `lastChangedAt` — the topology cache keys
+     *      on that stamp, so the next graph read recomputes the layout.
+     *   4. Log what was accepted, so an agent's "202 but nothing changed?"
+     *      is answerable from the server log alone.
      *
-     * Worth deciding while implementing: do you diff against the previous
-     * snapshot to emit `service.started` / `interface.down` events, or do you
-     * let the agent report those itself? The event endpoint exists for both.
+     * The read between step 1 and the store swap is not transactional, but
+     * the store only ever grows its network set — worst case a concurrently
+     * added network makes this report drop an edge that the host's next
+     * report (inventory is a periodic snapshot) brings back.
      */
     applyReport: async (report) => {
-      log.debug('inventory report received', { hostId: report.hostId });
-      throw notImplemented(
-        'inventory ingest',
-        'server/src/modules/inventory/inventory.service.ts → applyReport',
-      );
+      const knownNets = new Set((await store.inventory.listNetworks()).map((n) => n.id));
+      for (const net of report.networks ?? []) knownNets.add(net.id);
+
+      const edges = report.edges ?? [];
+      const dropped = edges.filter((e) => !knownNets.has(e.net));
+      if (dropped.length > 0) {
+        log.warn('dropping edges into unknown networks', {
+          hostId: report.hostId,
+          edges: dropped.map((e) => `${e.id}→${e.net}`),
+        });
+      }
+
+      await store.inventory.replaceHost({
+        ...report,
+        edges: edges.filter((e) => knownNets.has(e.net)),
+      });
+
+      log.info('inventory report applied', {
+        hostId: report.hostId,
+        collectedAt: report.collectedAt,
+        services: report.host.nodes.length,
+        interfaces: report.host.interfaces.length,
+        edges: edges.length - dropped.length,
+        networks: report.networks?.length ?? 0,
+        zones: report.zones?.length ?? 0,
+        records: report.records?.length ?? 0,
+      });
     },
   };
 }

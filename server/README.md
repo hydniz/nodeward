@@ -10,9 +10,12 @@ npm start -w server          # production
 ```
 
 The read endpoints work today (served from the demo fixture, which is what keeps
-the frontend alive). **Everything an agent writes is scaffolded but not
-implemented**: the routes exist, are authenticated, validated at the seam and
-documented — and answer `501` with the file to implement:
+the frontend alive), and the **inventory ingest is implemented**: an agent can
+post a facts snapshot and the host appears in the graph — see
+[docs/inventory-ingest.md](docs/inventory-ingest.md). **The remaining agent
+writes are scaffolded but not implemented**: the routes exist, are
+authenticated, validated at the seam and documented — and answer `501` with
+the file to implement:
 
 ```json
 { "error": { "code": "not_implemented",
@@ -59,6 +62,11 @@ src/
     explore.md          letting people browse the data: grafana against the same
                         postgres (role, views, queries), what nodeward answers
                         itself, csv export, prometheus interop
+    inventory-ingest.md the implemented inventory ingest: validation, ownership
+                        and merge semantics, decisions worth knowing
+    agent-identity.md   how an agent identifies its host (machine-id & friends),
+                        join token vs bearer token vs hostId, docker and native
+                        service discovery, the four service states
 
   modules/              one folder per bounded piece, wired in modules/index.ts
     inventory/          hosts, services, networks, domains + inventory ingest
@@ -114,7 +122,7 @@ Rules that keep this modular:
 | POST | `/api/agents/register` | ⛔ enrol with the join token → agent + token |
 | GET | `/api/agents/:agentId/config` | collector config (implemented, returns the default) |
 | POST | `/api/agents/:agentId/heartbeat` | ⛔ liveness |
-| POST | `/api/agents/:agentId/inventory` | ⛔ facts snapshot |
+| POST | `/api/agents/:agentId/inventory` | facts snapshot — implemented (validated, snapshot semantics) |
 | POST | `/api/agents/:agentId/health` | ⛔ metric samples |
 | POST | `/api/agents/:agentId/events` | ⛔ discrete events |
 | POST | `/api/agents/:agentId/batch` | ⛔ several of the above at once |
@@ -172,9 +180,9 @@ implementation has to keep:
 
 ## Suggested order to implement
 
-1. **inventory ingest** — `inventory.service.applyReport` +
-   `store.inventory.replaceHost`, then `topology.invalidate()`. After this a real
-   host appears in the graph and `DEMO_DATA=false` becomes possible.
+1. ~~**inventory ingest**~~ — done: `inventory.service.applyReport` +
+   `store.inventory.replaceHost` (see [docs/inventory-ingest.md](docs/inventory-ingest.md)).
+   A real host appears in the graph and `DEMO_DATA=false` is possible.
 2. **agent enrolment + auth** — `agents.service.register`,
    `store.agents.create/findByTokenHash`, and the lookup in
    `agents.auth.requireAgent`. Until this exists the api trusts the route, which

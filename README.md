@@ -6,10 +6,11 @@ Dark, mono-styled dashboard that renders your hosts, logical networks
 (tailnet, wireguard, k3s overlay, home lan, wan) and the links between them
 as an interactive topology graph.
 
-Currently a **static prototype**: the backend serves a fixed demo dataset
-through the same api the agents will use. The agent side of that api already
-exists as a documented skeleton (`/api/agents/**`) — routes, types, storage
-seams — with the logic left to be written; see
+Currently a **prototype with a working inventory ingest**: the backend serves
+a demo dataset through the same api the agents use, and an agent can already
+post its facts snapshot (`POST /api/agents/:id/inventory`) to appear in the
+graph. The rest of the agent api (`/api/agents/**`) is a documented skeleton —
+routes, types, storage seams — with the logic left to be written; see
 [server/README.md](server/README.md).
 
 ## Stack
