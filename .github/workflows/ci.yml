@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# ci — what has to be green before anything merges
+#
+# The same four commands a contributor runs locally, nothing more:
+# typecheck, server tests, client tests, client build. `npm audit` runs as a
+# separate non-blocking job so a freshly published advisory in a transitive
+# dependency cannot block an unrelated fix — it fails loudly, humans decide.
+# ---------------------------------------------------------------------------
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck -w server
+      - run: npm run test -w server
+      - run: npm run test -w client
+      - run: npm run build
+
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=moderate

@@ -42,8 +42,13 @@ export function createHealthService(store: Store, log: Logger): HealthService {
     /**
      * TODO(implement): accept a health report.
      *
-     * The route has authenticated the agent and checked that it owns
-     * `report.hostId`. What is left, in order:
+     * The route has authenticated the agent (`requireAgent`) and refused any
+     * payload naming a different host (`requireOwnHost`). Still, write
+     * `principal.hostId` — never `report.hostId` — into the store: the
+     * principal comes from the agent row, the report comes from the network,
+     * and only one of those two is allowed to decide whose samples these are.
+     *
+     * What is left, in order:
      *
      *   1. validate (`health.schema.ts`): every sample needs a finite value and
      *      a parseable timestamp; refuse the whole report on the first bad
@@ -76,7 +81,8 @@ export function createHealthService(store: Store, log: Logger): HealthService {
      *
      * Same rules as `ingest`, minus the sequence handling: events are not
      * idempotent by nature, so deduplicate on (hostId, at, kind, subject) if the
-     * agent may retry.
+     * agent may retry. `principal.hostId` decides the host here too — stamp it
+     * onto every event rather than trusting what the event carries.
      */
     ingestEvents: async (principal, events) => {
       log.debug('events received', { agentId: principal.agentId, count: events.length });

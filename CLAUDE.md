@@ -20,7 +20,7 @@ npm start                      # production: express serves api + built frontend
 
 ## What this is
 
-nodeward — an infrastructure dashboard rendering hosts, logical networks and links as an auto-laid-out topology graph. Currently a **static prototype**: the read API serves a fixed demo fixture; the agent write API (`/api/agents/**`) is a documented skeleton — routes exist, are authenticated and validated, and answer `501` with a `details.implementIn` pointer to the file to implement. `grep -r "TODO(implement)" server/` lists all seams. `server/README.md` documents endpoints, the agent protocol, and the suggested implementation order.
+nodeward — an infrastructure dashboard rendering hosts, logical networks and links as an auto-laid-out topology graph, aimed at production use in small companies (open source, AGPL-3.0). Implemented today: the read API (demo fixture or agent data), **inventory ingest**, **agent enrolment + per-agent token auth**, the **admin session** (login guarding UI + read API), and the **sqlite store**. Still seams answering `501` with a `details.implementIn` pointer: health ingest, series/retention, alerts, batch, postgres. `grep -r "TODO(implement)" server/` lists them. `server/README.md` documents endpoints, the agent protocol, and the suggested implementation order; `server/docs/security.md` documents the security model.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ Three npm workspaces:
 
 - **`config.ts` is the only file that reads `process.env`.** Everything else receives a `Config`. All env vars are documented in its header comment and the README table.
 - **`domain/` is types only, no runtime dependencies** — the contract agents, store and UI share (branded ids, inventory facts, health samples, topology geometry).
-- **Modules never import each other's internals and never touch a database.** They are constructed in `modules/index.ts` and talk to the `Store` repository interfaces (`store/types.ts`). The only driver today is `memory` (serves the fixture); `postgres` is planned per `server/docs/storage.md`.
+- **Modules never import each other's internals and never touch a database.** They are constructed in `modules/index.ts` and talk to the `Store` repository interfaces (`store/types.ts`). Drivers today: `memory` (development, serves the fixture) and `sqlite` (production default, `node:sqlite`); `postgres` is planned per `server/docs/storage.md`. Snapshot/merge semantics shared by all drivers live in `store/facts.ts`.
 - **Routes never leak internal errors.** Everything a route may fail with is an `ApiError` (`core/errors.ts`, one JSON problem shape); anything else is a bug, logged with stack, answered as a bare 500.
 - Middleware order (in `app.ts`): requestId → requestLog → json body → routes → notFound → errorHandler. Request context (id, per-request child logger) hangs on the request via `contextOf(req)` in `core/middleware.ts`.
 
@@ -48,9 +48,10 @@ Server tests build the real app against the memory store via `createTestApp` in 
 
 When implementing the ingest seams, keep these (from `server/README.md`):
 
-1. **The token decides the host, never the payload** — a `hostId` in the body that disagrees is a 403.
-2. **Retries are harmless** — inventory is an idempotent snapshot, health carries `seq` (drop anything not newer), events dedupe on `(hostId, at, kind, subject)`.
-3. **Acks steer the agent** — `IngestAck` can change the interval or request a fresh inventory.
+1. **The token decides the host, never the payload** — a `hostId` in the body that disagrees is a 403. Enforced centrally by `requireOwnHost` (`agents.auth.ts`) on every agent write route, so a new seam cannot forget it; inside a service, write `principal.hostId` to the store, never `report.hostId`.
+2. **A host may only claim what it owns** — dns record ids are a global namespace, so the store refuses a claim on an id another host holds (`store/facts.ts → splitRecordClaims`). The schema can only check what a record *claims*; ownership is the store's call.
+3. **Retries are harmless** — inventory is an idempotent snapshot, health carries `seq` (drop anything not newer), events dedupe on `(hostId, at, kind, subject)`.
+4. **Acks steer the agent** — `IngestAck` can change the interval or request a fresh inventory.
 
 ### The layout engine
 

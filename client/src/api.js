@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
+import { announceUnauthorized } from './auth.js';
 
 const cache = new Map();
+
+/** dropped after a login, so the fresh session refetches everything. */
+export function clearApiCache() {
+  cache.clear();
+}
 
 export function useApi(path) {
   const [data, setData] = useState(cache.get(path) ?? null);
@@ -11,6 +17,12 @@ export function useApi(path) {
     if (cache.has(path)) return undefined;
     fetch(path)
       .then((r) => {
+        if (r.status === 401) {
+          // the session is gone (expired, server restarted): hand control to
+          // the AuthGate instead of rendering a wall of failed panels
+          announceUnauthorized();
+          throw new Error('login required');
+        }
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
         return r.json();
       })

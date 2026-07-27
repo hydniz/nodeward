@@ -2,32 +2,36 @@
 // agents module — enrolment and liveness
 //
 // The lifecycle is described in `domain/agents.ts`. This service owns the parts
-// that are not storage: minting a token, deciding what config an agent gets, and
-// deriving `online / stale / pending` from `lastSeenAt`.
-//
-// `deriveStatus` and `defaultConfig` are implemented, because they are policy
-// the rest of the server depends on. Everything that needs to persist something
-// is a seam.
+// that are not storage: checking the join token, minting a bearer token,
+// deciding what config an agent gets, and deriving `online / stale / pending`
+// from `lastSeenAt`. The flow and its decisions are documented in
+// docs/agent-enrolment.md.
 // ---------------------------------------------------------------------------
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { Config } from '../../config.ts';
 import type { Logger } from '../../core/logger.ts';
-import { notImplemented } from '../../core/errors.ts';
+import { forbidden, notFound, unauthorized } from '../../core/errors.ts';
 import type { Store } from '../../store/index.ts';
+import { asAgentId } from '../../domain/common.ts';
 import type {
   Agent, AgentConfig, AgentHeartbeat, AgentId, AgentPrincipal, AgentRegistration,
   AgentRegistrationResult, AgentStatus, IngestAck,
 } from '../../domain/index.ts';
-
-const WHERE = 'server/src/modules/agents/agents.service.ts';
+import { hashToken, sameHash } from './agents.auth.ts';
 
 export interface AgentsService {
+  /** enrol: join token in — agent, one-time bearer token and config out. */
   register(registration: AgentRegistration): Promise<AgentRegistrationResult>;
+  /** operator view: every agent, with `status` derived at read time. */
   list(): Promise<Agent[]>;
+  /** one agent (status derived at read time), or null when unknown. */
   get(id: AgentId): Promise<Agent | null>;
+  /** cut the credential; the host's inventory stays (see the method doc). */
   revoke(id: AgentId): Promise<void>;
+  /** what the agent should collect: its stored config, else the default. */
   configFor(id: AgentId): Promise<AgentConfig>;
+  /** liveness ping; the ack may ask for a fresh inventory. */
   heartbeat(principal: AgentPrincipal, beat: AgentHeartbeat): Promise<IngestAck>;
 }
 
@@ -64,7 +68,11 @@ export function defaultConfig(config: Config): AgentConfig {
   };
 }
 
-/** a token an agent keeps: 32 random bytes, url-safe. */
+/**
+ * The bearer token an agent keeps: 32 random bytes (256 bit, unguessable),
+ * base64url-encoded so it survives headers, shell one-liners and config files
+ * without quoting. The server stores only its sha-256 hash (`hashToken`).
+ */
 export function mintToken(): string {
   return randomBytes(32).toString('base64url');
 }
@@ -76,28 +84,74 @@ export function createAgentsService(
 ): AgentsService {
   return {
     /**
-     * TODO(implement): enrol an agent.
+     * Enrol an agent: join token in, agent + bearer token out.
      *
-     *   1. check `registration.joinToken` against `config.agents.joinToken`
-     *      (constant time, see `hashToken`/`sameHash` in agents.auth.ts) and
-     *      refuse with 401 when it does not match or is not configured at all —
-     *      an api that enrols anybody is an open door into the graph
-     *   2. if a non-revoked agent already exists for `registration.hostId`,
-     *      decide: return 409, or replace it (re-install case). Replacing is
-     *      friendlier; log it either way
-     *   3. build the agent: `id: randomUUID()` (node:crypto),
-     *      `enrolledAt: new Date().toISOString()`,
-     *      `lastSeenAt: null`, `status: 'pending'`
-     *   4. `const token = mintToken()` → store only `hashToken(token)` via
-     *      `store.agents.create(agent, hash)`
-     *   5. return agent + credentials + `defaultConfig(config)`; this is the only
-     *      response that ever contains the plaintext token
+     * The join token is the one gate — an api that enrols anybody is an open
+     * door into the graph, so enrolment is closed (401) while no token is
+     * configured, and the comparison runs in constant time (hash both sides,
+     * `sameHash`). A host that already has an agent is the re-install case:
+     * the store replaces the old row (friendlier than a 409 — a wiped machine
+     * cannot know it was enrolled before), which also kills the old token.
+     *
+     * Only the hash of the minted token is stored; the response is the one
+     * place the plaintext ever exists.
      */
     register: async (registration) => {
       log.info('enrolment attempt', { hostId: registration.hostId, name: registration.name });
-      throw notImplemented('agent enrolment', `${WHERE} → register`);
+
+      const expected = config.agents.joinToken;
+      if (!expected) throw unauthorized('enrolment is closed: no join token configured');
+      if (!sameHash(hashToken(registration.joinToken), hashToken(expected))) {
+        throw unauthorized('invalid join token');
+      }
+
+      const previous = await store.agents.getByHost(registration.hostId);
+      if (previous) {
+        // an agent that is *still reporting* being replaced is not a normal
+        // re-install — it is what a stolen join token or a cloned vm (two
+        // machines, one machine-id → one hostId) looks like. The enrolment
+        // still goes through (the operator may genuinely be re-imaging), but
+        // loudly, so the log tells the story before the graph gets weird.
+        const state = deriveStatus(previous, Date.now(), config.agents.heartbeatTimeoutSeconds);
+        if (state === 'online') {
+          log.warn('replacing an agent that is still reporting — a re-install would be offline; check for a cloned machine or a leaked join token', {
+            hostId: registration.hostId, previousAgentId: previous.id, lastSeenAt: previous.lastSeenAt,
+          });
+        } else {
+          log.info('replacing existing agent for host (re-install)', {
+            hostId: registration.hostId, previousAgentId: previous.id,
+          });
+        }
+      }
+
+      const agent: Agent = {
+        id: asAgentId(randomUUID()),
+        hostId: registration.hostId,
+        name: registration.name,
+        version: registration.version,
+        ...(registration.platform !== undefined ? { platform: registration.platform } : {}),
+        ...(registration.labels !== undefined ? { labels: registration.labels } : {}),
+        enrolledAt: new Date().toISOString(),
+        lastSeenAt: null,
+        status: 'pending',
+      };
+      const token = mintToken();
+      await store.agents.create(agent, hashToken(token));
+
+      log.info('agent enrolled', { agentId: agent.id, hostId: agent.hostId });
+      return {
+        agent,
+        credentials: { agentId: agent.id, token, expiresAt: null },
+        config: defaultConfig(config),
+      };
     },
 
+    /**
+     * The operator's list. The stored `status` only distinguishes
+     * revoked/not-revoked — everything else is a function of `lastSeenAt` and
+     * the heartbeat window, so it is recomputed on every read (`deriveStatus`)
+     * against one shared `now`, keeping the whole list consistent.
+     */
     list: async () => {
       const agents = await store.agents.list();
       const at = Date.now();
@@ -107,6 +161,7 @@ export function createAgentsService(
       }));
     },
 
+    /** one agent, status derived exactly like in `list()`. */
     get: async (id) => {
       const agent = await store.agents.get(id);
       if (!agent) return null;
@@ -117,34 +172,58 @@ export function createAgentsService(
     },
 
     /**
-     * TODO(implement): revoke.
+     * Revoke: the token stops working, the host's inventory stays.
      *
-     * `store.agents.revoke(id)` and decide what happens to the host: keeping its
-     * inventory (so the graph stays complete but goes stale) is usually right;
-     * removing it is `store.inventory.removeHost`. Both are defensible — pick one
-     * and document it in the ui.
+     * Keeping the inventory means the graph stays complete and merely goes
+     * stale — revocation cuts a credential, it does not decommission a
+     * machine. An operator who wants the host gone removes it explicitly
+     * (`store.inventory.removeHost`); until then "revoked but still drawn"
+     * is the honest picture.
      */
     revoke: async (id) => {
-      log.info('revoke requested', { agentId: id });
-      throw notImplemented('agent revocation', `${WHERE} → revoke`);
+      const agent = await store.agents.get(id);
+      if (!agent) throw notFound(`agent ${id}`);
+      await store.agents.revoke(id);
+      log.info('agent revoked', { agentId: id, hostId: agent.hostId });
     },
 
+    /**
+     * The config an agent pulls on start and after every change. Per-agent
+     * config (set by an operator, survives re-installs — the store carries it
+     * over to the new agent id) wins; without one the server default applies.
+     * This is what lets collection be changed centrally without touching hosts.
+     */
     configFor: async (id) => {
       const stored = await store.agents.getConfig(id);
       return stored ?? defaultConfig(config);
     },
 
     /**
-     * TODO(implement): heartbeat.
+     * The cheapest endpoint there is: touch `lastSeenAt`, answer an ack. Its
+     * value is that a host with nothing to report still proves it is alive —
+     * which is what turns a missing report into a `down` host instead of a
+     * silent one.
      *
-     * The cheapest endpoint there is: `store.agents.touch(agentId, now)` and an
-     * ack. Its value is that a host with nothing to report still proves it is
-     * alive — which is what turns a missing report into a `down` host instead of
-     * a silent one.
+     * The ack steers the agent (protocol invariant 3): a heartbeat from a host
+     * the store holds no facts for gets `wantInventory`, which is how a server
+     * with an empty store recovers without anyone logging into a host.
      */
     heartbeat: async (principal, beat) => {
       log.debug('heartbeat', { agentId: principal.agentId, hostId: beat.hostId });
-      throw notImplemented('heartbeat', `${WHERE} → heartbeat`);
+      // the token decides the host, never the payload (protocol invariant 1)
+      if (beat.hostId !== principal.hostId) {
+        throw forbidden('heartbeat hostId does not match the host this token owns');
+      }
+      const receivedAt = new Date().toISOString();
+      await store.agents.touch(principal.agentId, receivedAt);
+      const known = await store.inventory.getHost(principal.hostId);
+      return {
+        accepted: 1,
+        rejected: 0,
+        agentId: principal.agentId,
+        receivedAt,
+        ...(known ? {} : { wantInventory: true }),
+      };
     },
   };
 }

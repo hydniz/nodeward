@@ -2,6 +2,8 @@
 
 **nodeward.dev** — see your whole server infrastructure at a glance.
 
+Free and open source under [AGPL-3.0](LICENSE).
+
 Dark, mono-styled dashboard that renders your hosts, logical networks
 (tailnet, wireguard, k3s overlay, home lan, wan) and the links between them
 as an interactive topology graph.
@@ -43,8 +45,17 @@ Open http://localhost:5173 (vite proxies `/api` to the Express server).
 ## Production
 
 ```sh
+docker compose up -d --build   # sqlite store, login-protected, one volume
+```
+
+See [server/docs/deployment.md](server/docs/deployment.md) (docker, tls via
+caddy, systemd, backups) and [server/docs/security.md](server/docs/security.md)
+(what production mode enforces: admin login, join-token strength, no dev
+shortcuts). Bare-metal equivalent:
+
+```sh
 npm run build      # builds client/dist
-npm start          # express serves api + built frontend on :4001
+NODE_ENV=production ADMIN_PASSWORD=… AGENT_JOIN_TOKEN=… npm start
 ```
 
 ## Navigation

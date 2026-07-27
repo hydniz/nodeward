@@ -28,6 +28,9 @@ import { createAgentsService } from './agents/agents.service.ts';
 import { agentRoutes } from './agents/agents.routes.ts';
 import { createAlertsService } from './alerts/alerts.service.ts';
 import { alertRoutes } from './alerts/alerts.routes.ts';
+import { createAuthService } from './auth/auth.service.ts';
+import { authRoutes } from './auth/auth.routes.ts';
+import { requireSession } from './auth/auth.middleware.ts';
 
 export interface Modules {
   inventory: ReturnType<typeof createInventoryService>;
@@ -36,6 +39,7 @@ export interface Modules {
   health: ReturnType<typeof createHealthService>;
   agents: ReturnType<typeof createAgentsService>;
   alerts: ReturnType<typeof createAlertsService>;
+  auth: ReturnType<typeof createAuthService>;
   /** everything mounted under /api. */
   router: Router;
 }
@@ -47,24 +51,39 @@ export function createModules(config: Config, store: Store, log: Logger): Module
   const health = createHealthService(store, log.child({ module: 'health' }));
   const alerts = createAlertsService(store, log.child({ module: 'alerts' }));
   const agents = createAgentsService(config, store, log.child({ module: 'agents' }));
+  const auth = createAuthService(config, log.child({ module: 'auth' }));
 
   const router = Router();
 
-  // read side — what the frontend consumes
-  router.use(inventoryRoutes(inventory, topology));
-  router.use(topologyRoutes(topology));
-  router.use(summaryRoutes(summary));
-  router.use(healthRoutes(health));
-  router.use(alertRoutes(alerts));
+  const session = requireSession(config, auth, log.child({ module: 'auth' }));
 
-  // write side — what the agents talk to
-  router.use(agentRoutes(config, store, agents, health, inventory, log.child({ module: 'agents' })));
+  // login/logout/me — reachable without a session, obviously
+  router.use(authRoutes(auth, log.child({ module: 'auth' })));
+
+  // write side — what the agents talk to (bearer tokens, never sessions).
+  // Mounted BEFORE the session gate below: `Router.use(middleware, …)` runs
+  // its middleware for every request passing that layer, so agent requests
+  // must be fully handled before the human gate is ever consulted. The
+  // operator endpoints inside take the session gate per route.
+  router.use(agentRoutes(config, store, agents, health, inventory, session, log.child({ module: 'agents' })));
+
+  // everything a human reads sits behind the admin session (open while
+  // developing without ADMIN_PASSWORD; production refuses to boot like that).
+  // The inventory is the sensitive document here — hostnames, internal ips,
+  // open ports — so the read api is gated exactly like the ui that renders it.
+  const protectedReads = Router();
+  protectedReads.use(session);
+  protectedReads.use(inventoryRoutes(inventory, topology));
+  protectedReads.use(topologyRoutes(topology));
+  protectedReads.use(summaryRoutes(summary));
+  protectedReads.use(healthRoutes(health));
+  protectedReads.use(alertRoutes(alerts));
 
   /**
    * Where the data comes from, so the ui can say so out loud instead of showing
    * demo numbers as if they were measurements.
    */
-  router.get('/meta', handler(async (_req, res) => {
+  protectedReads.get('/meta', handler(async (_req, res) => {
     res.json({
       version: process.env.npm_package_version ?? '0.1.0',
       env: config.env,
@@ -76,8 +95,10 @@ export function createModules(config: Config, store: Store, log: Logger): Module
     });
   }));
 
+  router.use(protectedReads);
+
   return {
-    inventory, topology, summary, health, agents, alerts, router,
+    inventory, topology, summary, health, agents, alerts, auth, router,
   };
 }
 

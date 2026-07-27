@@ -10,12 +10,14 @@ npm start -w server          # production
 ```
 
 The read endpoints work today (served from the demo fixture, which is what keeps
-the frontend alive), and the **inventory ingest is implemented**: an agent can
-post a facts snapshot and the host appears in the graph — see
-[docs/inventory-ingest.md](docs/inventory-ingest.md). **The remaining agent
-writes are scaffolded but not implemented**: the routes exist, are
-authenticated, validated at the seam and documented — and answer `501` with
-the file to implement:
+the frontend alive), and the first two agent steps are implemented: the
+**inventory ingest** (an agent posts a facts snapshot and the host appears in
+the graph — [docs/inventory-ingest.md](docs/inventory-ingest.md)) and
+**enrolment + per-agent auth** (join token → bearer token, heartbeat,
+revocation — [docs/agent-enrolment.md](docs/agent-enrolment.md)). **The
+remaining agent writes are scaffolded but not implemented**: the routes exist,
+are authenticated, validated at the seam and documented — and answer `501`
+with the file to implement:
 
 ```json
 { "error": { "code": "not_implemented",
@@ -53,8 +55,11 @@ src/
   store/                storage behind interfaces
     types.ts            InventoryRepository · HealthRepository ·
                         AgentRepository · AlertRepository → Store
-    memory.ts           the driver in use: serves the fixture, every write is a seam
-    index.ts            createStore(); the schema lives in docs/storage.md
+    facts.ts            the snapshot/merge semantics, shared by every driver
+    memory.ts           development driver: serves the fixture, volatile
+    sqlite.ts           production driver (node:sqlite): one file, durable
+    index.ts            createStore(); the sql schema for postgres lives in
+                        docs/storage.md
 
   docs/
     storage.md          how agent data is stored: three storage classes, the
@@ -64,11 +69,19 @@ src/
                         itself, csv export, prometheus interop
     inventory-ingest.md the implemented inventory ingest: validation, ownership
                         and merge semantics, decisions worth knowing
+    agent-enrolment.md  the implemented enrolment + auth: join token flow,
+                        token storage, re-install and revocation semantics
+    security.md         the security model: trust boundaries, what the server
+                        enforces, join-token blast radius, deployment checklist
+    deployment.md       running it for real: docker compose, tls via caddy,
+                        systemd, backup = one volume
     agent-identity.md   how an agent identifies its host (machine-id & friends),
                         join token vs bearer token vs hostId, docker and native
                         service discovery, the four service states
 
   modules/              one folder per bounded piece, wired in modules/index.ts
+    auth/               the admin session: login, cookie, the gate in front of
+                        everything a human reads
     inventory/          hosts, services, networks, domains + inventory ingest
     topology/           the layout, cached; hands out host boxes
     summary/            fleet counters for the sidebar and tiles
@@ -95,7 +108,15 @@ Rules that keep this modular:
 
 ## Endpoints
 
-### read — what the frontend consumes
+### auth — how a browser becomes trusted
+
+| method | path | notes |
+| --- | --- | --- |
+| POST | `/api/auth/login` | `{password}` → httpOnly session cookie (rate limited) |
+| POST | `/api/auth/logout` | drop the session |
+| GET | `/api/auth/me` | `{required, authenticated}` — what the ui renders first |
+
+### read — what the frontend consumes (admin session required)
 
 | method | path | notes |
 | --- | --- | --- |
@@ -119,15 +140,15 @@ Rules that keep this modular:
 
 | method | path | notes |
 | --- | --- | --- |
-| POST | `/api/agents/register` | ⛔ enrol with the join token → agent + token |
+| POST | `/api/agents/register` | enrol with the join token → agent + token — implemented |
 | GET | `/api/agents/:agentId/config` | collector config (implemented, returns the default) |
-| POST | `/api/agents/:agentId/heartbeat` | ⛔ liveness |
+| POST | `/api/agents/:agentId/heartbeat` | liveness — implemented (ack may ask for inventory) |
 | POST | `/api/agents/:agentId/inventory` | facts snapshot — implemented (validated, snapshot semantics) |
 | POST | `/api/agents/:agentId/health` | ⛔ metric samples |
 | POST | `/api/agents/:agentId/events` | ⛔ discrete events |
 | POST | `/api/agents/:agentId/batch` | ⛔ several of the above at once |
-| GET | `/api/agents`, `/api/agents/:agentId` | operator view |
-| DELETE | `/api/agents/:agentId` | ⛔ revoke the token |
+| GET | `/api/agents`, `/api/agents/:agentId` | operator view (admin session) |
+| DELETE | `/api/agents/:agentId` | revoke the token (admin session); inventory stays |
 
 ⛔ = mounted and documented, `501` until implemented.
 
@@ -147,16 +168,24 @@ Rules that keep this modular:
    after downtime ──── POST /api/agents/:id/batch         {items[]}
 ```
 
-Every request carries `Authorization: Bearer <token>`. Three invariants the
+Every request carries `Authorization: Bearer <token>`. Four invariants the
 implementation has to keep:
 
 1. **the token decides the host, never the payload.** A report is applied to the
    host the token belongs to; a `hostId` in the body that disagrees is a `403`.
-   Otherwise one agent could overwrite another's inventory.
-2. **retries are harmless.** Inventory is a snapshot (idempotent by design),
+   Otherwise one agent could overwrite another's inventory. This is not left to
+   each route: `requireOwnHost` (`agents.auth.ts`) is mounted on every agent
+   write route and scans the whole body, so a seam cannot forget it — when you
+   implement one, keep writing `principal.hostId` into the store rather than
+   the report's.
+2. **a host may only claim what it owns.** Beyond the envelope, dns record ids
+   are a *global* namespace: the validator checks what a record claims, the
+   store checks who already holds the id, and a claim on somebody else's is
+   dropped and logged (`store/facts.ts → splitRecordClaims`).
+3. **retries are harmless.** Inventory is a snapshot (idempotent by design),
    health carries `seq` (drop anything not newer), events deduplicate on
    `(hostId, at, kind, subject)`.
-3. **acks steer the agent.** `IngestAck` can change the interval or ask for a
+4. **acks steer the agent.** `IngestAck` can change the interval or ask for a
    fresh inventory (`wantInventory`) — that is how a server with an empty store
    recovers without anyone logging into a host.
 
@@ -168,25 +197,33 @@ implementation has to keep:
 | `NODE_ENV` | `development` | `production` closes the development shortcuts |
 | `LOG_LEVEL` / `LOG_JSON` | `debug` / off | logging (`info`/on in production) |
 | `LOG_DIR` | `server/logs` in production, unset in dev | daily `nodeward-YYYY-MM-DD.log` files (json lines, with `src` = `file:line` of the call) |
-| `STORE_DRIVER` | `memory` | `memory` \| `postgres` |
+| `STORE_DRIVER` | `memory` dev / `sqlite` prod | `memory` \| `sqlite` \| `postgres` |
+| `SQLITE_PATH` | `server/data/nodeward.db` | database file for `sqlite`; `:memory:` works (tests) |
 | `DATABASE_URL` | — | required for `postgres` |
 | `DEMO_DATA` | `true` on memory | serve the fixture inventory |
-| `AGENT_JOIN_TOKEN` | — | secret needed to enrol; enrolment is closed while unset |
-| `AGENT_TOKEN` | — | development shortcut: one token for all agents |
+| `ADMIN_PASSWORD` | — | login for the ui, read api and operator endpoints. Required in production (min 8 chars) unless `AUTH_DISABLED=true` |
+| `AUTH_DISABLED` | `false` | explicit opt-out: run without a login ("this dashboard is meant to be public") |
+| `AGENT_JOIN_TOKEN` | — | secret needed to enrol; enrolment is closed while unset. Min 16 chars in production |
+| `AGENT_TOKEN` | — | development shortcut: one token for all agents. Refused in production |
 | `AGENT_HEARTBEAT_TIMEOUT` | `90` | seconds until an agent counts as `stale` |
 | `AGENT_INTERVAL` | `15` | interval handed to agents |
 | `INGEST_MAX_BODY` | `1048576` | max report size, refused before parsing |
+| `REGISTER_RATE_LIMIT` | `10` | enrolment attempts per ip per minute before `429` |
+| `TRUST_PROXY` | `false` | express `trust proxy`: `true`, a hop count, or a preset (`loopback`). Set behind nginx/caddy so client ips stay truthful |
 | `HEALTH_RETENTION_DAYS` | `30` | how long samples are kept |
+
+Production hardening, the threat model and a deployment checklist live in
+[docs/security.md](docs/security.md).
 
 ## Suggested order to implement
 
 1. ~~**inventory ingest**~~ — done: `inventory.service.applyReport` +
    `store.inventory.replaceHost` (see [docs/inventory-ingest.md](docs/inventory-ingest.md)).
    A real host appears in the graph and `DEMO_DATA=false` is possible.
-2. **agent enrolment + auth** — `agents.service.register`,
-   `store.agents.create/findByTokenHash`, and the lookup in
-   `agents.auth.requireAgent`. Until this exists the api trusts the route, which
-   is fine on a laptop and nowhere else.
+2. ~~**agent enrolment + auth**~~ — done: `agents.service.register/heartbeat/revoke`,
+   `store.agents.*`, and the per-agent token lookup in `agents.auth.requireAgent`
+   (see [docs/agent-enrolment.md](docs/agent-enrolment.md)). Reports are now
+   pinned to the host the token owns.
 3. **health ingest** — `health.service.ingest` + `store.health.append/latest*`.
    The moment `latestAll()` returns data, `/api/servers` stops showing fixture
    numbers: the merge in `inventory.service.withHealth` already prefers measured

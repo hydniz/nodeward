@@ -167,10 +167,22 @@ export function createInventoryService(store: Store, log: Logger): InventoryServ
         });
       }
 
-      await store.inventory.replaceHost({
+      const { rejectedRecords } = await store.inventory.replaceHost({
         ...report,
         edges: edges.filter((e) => knownNets.has(e.net)),
       });
+
+      // a host may only report dns records it owns; the store refuses the rest
+      // (facts.ts → splitRecordClaims). Benign explanation: a service moved and
+      // the previous owner has not re-reported yet, which heals on its next
+      // snapshot. The other explanation is a compromised host trying to
+      // re-point a name, so this is a warning and names both sides.
+      if (rejectedRecords.length > 0) {
+        log.warn('refused dns records held by another host — a host may only report records it owns', {
+          hostId: report.hostId,
+          records: rejectedRecords.map((r) => `${r.id} held by ${r.heldBy ?? 'shared zone data'}`),
+        });
+      }
 
       log.info('inventory report applied', {
         hostId: report.hostId,

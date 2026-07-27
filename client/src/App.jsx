@@ -1,5 +1,5 @@
 import React from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router';
 import Sidebar from './components/Sidebar.jsx';
 import OverviewPage from './pages/OverviewPage.jsx';
 import ServersPage from './pages/ServersPage.jsx';

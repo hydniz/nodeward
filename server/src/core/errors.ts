@@ -61,6 +61,7 @@ export const forbidden = (message = 'not allowed') => new ApiError('forbidden', 
 export const notFound = (what: string) => new ApiError('not_found', `${what} not found`);
 export const conflict = (message: string, details?: Record<string, unknown>) => new ApiError('conflict', message, details);
 export const unprocessable = (message: string, details?: Record<string, unknown>) => new ApiError('unprocessable', message, details);
+export const tooManyRequests = (message = 'too many requests') => new ApiError('too_many_requests', message);
 export const unavailable = (message: string) => new ApiError('unavailable', message);
 
 /**

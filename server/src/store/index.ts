@@ -20,6 +20,17 @@ export async function createStore(config: Config, log: Logger): Promise<Store> {
       log.info('store: memory', { demoData: config.store.demoData });
       return createMemoryStore({ demoData: config.store.demoData });
 
+    case 'sqlite': {
+      // imported lazily so memory-store users never load node:sqlite (and
+      // never see its experimental warning)
+      const { createSqliteStore } = await import('./sqlite.ts');
+      log.info('store: sqlite', { file: config.store.sqlitePath, demoData: config.store.demoData });
+      return createSqliteStore({
+        file: config.store.sqlitePath,
+        demoData: config.store.demoData,
+      });
+    }
+
     case 'postgres':
       /**
        * TODO(implement): the postgres driver.

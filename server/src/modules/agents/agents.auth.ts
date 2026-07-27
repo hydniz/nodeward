@@ -5,42 +5,100 @@
 // issued once at enrolment and stored hashed — the server never keeps the
 // plaintext, exactly like a password.
 //
-// Two middlewares:
-//   requireAgent    — for /api/agents/:agentId/*  (the reporting endpoints)
-//   requireOperator — for the human-facing management endpoints
+// Two middlewares, always paired on the reporting endpoints
+// (/api/agents/:agentId/*): `requireAgent` decides *who* is calling, and
+// `requireOwnHost` enforces that the payload does not claim to be somebody
+// else. The human-facing management endpoints are guarded by the admin session
+// from `modules/auth/` instead — wired together in modules/index.ts.
 //
-// What is implemented here is the *plumbing*: pulling the token out, hashing it,
-// deciding what a missing configuration means. Who owns which token is a store
-// lookup and therefore a seam.
+// `requireAgent` resolves the token to its agent via the store (hash lookup)
+// and sets the principal from that row — never from the request body. Two
+// documented development shortcuts remain: the shared AGENT_TOKEN, and the
+// open no-token mode outside production.
 // ---------------------------------------------------------------------------
 
-import { createHash, timingSafeEqual } from 'node:crypto';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { Config } from '../../config.ts';
 import type { Logger } from '../../core/logger.ts';
-import { notImplemented, unauthorized } from '../../core/errors.ts';
+import { hashToken, sameSecret } from '../../core/crypto.ts';
+import { forbidden, unauthorized } from '../../core/errors.ts';
 import { asAgentId, asHostId } from '../../domain/common.ts';
 import type { AgentPrincipal } from '../../domain/index.ts';
 import type { Store } from '../../store/index.ts';
 
+// the comparison primitives live in core/crypto.ts (shared with the admin
+// login); re-exported here because they are part of this module's api surface
+export { hashToken, sameHash } from '../../core/crypto.ts';
+
+// the principal hangs on the request under a symbol so no route or middleware
+// can collide with (or fake) it by setting a plain string property
 const PRINCIPAL = Symbol('nodeward.agent');
 
-/** the authenticated agent, for handlers that need to know who reported. */
+/**
+ * The authenticated agent, for handlers that need to know who reported.
+ * Only `requireAgent` ever sets it; calling this on a route that is not behind
+ * that middleware is a programming error and answers 401 instead of crashing.
+ */
 export function principalOf(req: Request): AgentPrincipal {
   const p = (req as Request & { [PRINCIPAL]?: AgentPrincipal })[PRINCIPAL];
   if (!p) throw unauthorized('no agent principal on this request');
   return p;
 }
 
-/** tokens are compared as sha-256 hashes, in constant time. */
-export const hashToken = (token: string): string => createHash('sha256').update(token).digest('hex');
+/**
+ * Every `hostId` anywhere in a parsed json body.
+ *
+ * Iterative rather than recursive on purpose: the body is attacker-supplied
+ * json, and a deeply nested one would blow the stack of a recursive walk.
+ * Only the key name matters — `server` fields (a p2p tunnel legitimately names
+ * the peer on its far end) are not `hostId` and are never collected.
+ */
+function claimedHostIds(body: unknown): string[] {
+  const found: string[] = [];
+  const stack: unknown[] = [body];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (Array.isArray(value)) {
+      for (const item of value) stack.push(item);
+      continue;
+    }
+    if (!value || typeof value !== 'object') continue;
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'hostId' && typeof nested === 'string') found.push(nested);
+      else if (nested && typeof nested === 'object') stack.push(nested);
+    }
+  }
+  return found;
+}
 
-const sameHash = (a: string, b: string): boolean => {
-  const ba = Buffer.from(a, 'hex');
-  const bb = Buffer.from(b, 'hex');
-  return ba.length === bb.length && timingSafeEqual(ba, bb);
+/**
+ * Protocol invariant 1, as middleware: **the token decides the host, never the
+ * payload.**
+ *
+ * Mounted on every route an agent writes through, so a new ingest seam cannot
+ * quietly forget the check — which is exactly what had happened to the health,
+ * events and batch routes, where the invariant was documented but never coded.
+ * The check runs over the whole body (`items[]` of a batch included) so it
+ * covers the seams before they are implemented.
+ *
+ * A body that names no host at all is fine: the principal decides anyway, and
+ * every service reads the host from there. Only a *disagreeing* claim is a 403
+ * — "I know you, and you are not that host".
+ */
+export const requireOwnHost: RequestHandler = (req, _res, next) => {
+  const mine = principalOf(req).hostId as string;
+  for (const claimed of claimedHostIds(req.body)) {
+    if (claimed !== mine) {
+      next(forbidden('payload hostId does not match the host this token owns'));
+      return;
+    }
+  }
+  next();
 };
 
+/** the token from `Authorization: Bearer <token>`, or null when the header is
+ *  missing or not bearer-shaped. Never throws — what a missing token means
+ *  (401 or the open development mode) is `requireAgent`'s decision. */
 function bearer(req: Request): string | null {
   const header = req.header('authorization');
   if (!header) return null;
@@ -49,6 +107,25 @@ function bearer(req: Request): string | null {
   return token.trim() || null;
 }
 
+/**
+ * Authentication for everything under `/api/agents/:agentId/*` — every route
+ * an agent reports to. Three paths, checked in order:
+ *
+ *   1. `AGENT_TOKEN` configured → shared-token mode: one secret for every
+ *      agent. The token cannot name a host, so the principal's host comes
+ *      from the body/route — a documented compromise for laptops, never
+ *      production.
+ *   2. no token sent → refused in production, allowed while developing (so
+ *      the api can be poked with curl), logged loudly once per route and
+ *      marked `unauthenticated: true` on the principal.
+ *   3. otherwise per-agent lookup: hash the token, find the agent row, refuse
+ *      unknown (401) / revoked (403) / wrong route (403), build the principal
+ *      from the row, stamp liveness.
+ *
+ * The two error answers are deliberate: 401 means "I do not know you" (get a
+ * new token by re-enrolling), 403 means "I know you and the answer is no"
+ * (revoked, or a token used for another agent's route).
+ */
 export function requireAgent(config: Config, store: Store, log: Logger): RequestHandler {
   const warnOnce = new Set<string>();
 
@@ -60,7 +137,7 @@ export function requireAgent(config: Config, store: Store, log: Logger): Request
       // development shortcut: one shared token for every agent, from
       // AGENT_TOKEN. Good enough to get an agent talking, never for production.
       if (config.agents.sharedToken) {
-        if (!token || !sameHash(hashToken(token), hashToken(config.agents.sharedToken))) {
+        if (!token || !sameSecret(token, config.agents.sharedToken)) {
           throw unauthorized('invalid agent token');
         }
         if (!routeAgentId) throw unauthorized('agent id missing from the route');
@@ -91,54 +168,29 @@ export function requireAgent(config: Config, store: Store, log: Logger): Request
         return next();
       }
 
-      /**
-       * TODO(implement): the real lookup.
-       *
-       *   const agent = await store.agents.findByTokenHash(hashToken(token));
-       *   if (!agent) throw unauthorized('unknown agent token');
-       *   if (agent.status === 'revoked') throw forbidden('agent revoked');
-       *   if (routeAgentId && agent.id !== routeAgentId) {
-       *     throw forbidden('token does not belong to this agent');
-       *   }
-       *   set the principal from `agent` (never from the request body) and
-       *   `store.agents.touch(agent.id, new Date().toISOString())`.
-       *
-       * `forbidden()` and `unauthorized()` from `core/errors.ts` are the two
-       * answers this should ever give.
-       *
-       * The last point is the one that matters for security: a report is only
-       * ever applied to the host the *token* owns, never to the host id the
-       * payload claims. Otherwise one agent could overwrite another's inventory.
-       */
-      throw notImplemented(
-        'per-agent token authentication',
-        'server/src/modules/agents/agents.auth.ts → requireAgent',
-      );
+      // per-agent tokens: the token names the agent, the agent row names the
+      // host. The principal is built from that row and never from the request
+      // body — a report is only ever applied to the host the token owns.
+      const agent = await store.agents.findByTokenHash(hashToken(token));
+      if (!agent) throw unauthorized('unknown agent token');
+      if (agent.status === 'revoked') throw forbidden('agent revoked');
+      if (routeAgentId && agent.id !== routeAgentId) {
+        throw forbidden('token does not belong to this agent');
+      }
+      (req as Request & { [PRINCIPAL]?: AgentPrincipal })[PRINCIPAL] = {
+        agentId: agent.id,
+        hostId: agent.hostId,
+        unauthenticated: false,
+      };
+      // every authenticated request proves liveness, so `lastSeenAt` (and the
+      // derived online/stale status) is stamped here instead of in each service
+      await store.agents.touch(agent.id, new Date().toISOString());
+      return next();
     };
     run().catch(next);
   };
 }
 
-/**
- * Guard for the endpoints a human calls (listing and revoking agents).
- *
- * TODO(implement): whatever the ui ends up using — a session cookie, an api key
- * from `settings`, oidc. Until then the guard is a single documented gate: open
- * while developing, closed in production.
- */
-export function requireOperator(config: Config, log: Logger): RequestHandler {
-  let warned = false;
-  return (req: Request, _res: Response, next: NextFunction) => {
-    if (config.env !== 'production') {
-      if (!warned) {
-        warned = true;
-        log.warn('operator endpoints are unauthenticated in development');
-      }
-      return next();
-    }
-    return next(notImplemented(
-      'operator authentication',
-      'server/src/modules/agents/agents.auth.ts → requireOperator',
-    ));
-  };
-}
+// the guard for the endpoints a human calls (listing and revoking agents) is
+// the admin session — `modules/auth/auth.middleware.ts → requireSession`,
+// handed to `agentRoutes` by the module registry

@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# the smallest real deployment: nodeward + one volume
+#
+# Secrets come from an .env file next to this compose file:
+#
+#   ADMIN_PASSWORD=…      # login for the dashboard   (openssl rand -base64 18)
+#   AGENT_JOIN_TOKEN=…    # secret agents enrol with  (openssl rand -base64 24)
+#
+# This publishes plain http on :4001 — fine on a trusted network or behind
+# your own reverse proxy. For public exposure put tls in front and set
+# TRUST_PROXY; a ready-made caddy pairing is in server/docs/deployment.md.
+# ---------------------------------------------------------------------------
+
+services:
+  nodeward:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      AGENT_JOIN_TOKEN: ${AGENT_JOIN_TOKEN:?set AGENT_JOIN_TOKEN in .env}
+      # TRUST_PROXY: "1"        # uncomment when a reverse proxy sits in front
+    volumes:
+      - nodeward-data:/data     # sqlite + logs — this volume IS the backup
+
+volumes:
+  nodeward-data:

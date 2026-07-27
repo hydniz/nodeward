@@ -5,9 +5,11 @@
 //   • serves the demo inventory, so the frontend has a full picture to draw
 //   • applies inventory snapshots from agents (replaceHost/removeHost), which
 //     is what lets a real host replace its fixture twin
+//   • keeps enrolled agents: the row, the sha-256 hash of the bearer token
+//     (never the plaintext), and per-agent collector config
 //
 // What it deliberately does not do:
-//   • keep health samples, agents or alerts — those write paths throw
+//   • keep health samples or alerts — those write paths throw
 //     `not_implemented` and name themselves, because that is where the real
 //     logic (and the real storage decision) belongs
 //
@@ -19,9 +21,10 @@ import { notImplemented } from '../core/errors.ts';
 import { demoInventory } from '../fixtures/demo.ts';
 import type {
   Agent, AgentConfig, AgentEvent, AgentId, Alert, AlertRule, HealthReport,
-  HostFacts, HostHealth, HostId, HostView, Inventory, InventoryReport,
+  HostHealth, HostId, Inventory, InventoryReport,
   MetricSeries, SeriesInfo, SeriesQuery, Timestamp,
 } from '../domain/index.ts';
+import { freshHostView, mergeById, splitRecordClaims } from './facts.ts';
 import type {
   AgentRepository, AlertRepository, HealthRepository, InventoryRepository, Store,
 } from './types.ts';
@@ -31,46 +34,6 @@ const WHERE = 'server/src/store/memory.ts';
 const empty = (): Inventory => ({
   hosts: [], networks: [], edges: [], p2p: [], zones: [], records: [],
 });
-
-/**
- * Merge a shared collection (networks, zones) by id.
- *
- * How it works: existing entries keep their position, incoming entries are
- * folded over them — an entry with a known id is merged field-wise
- * (`{ ...old, ...incoming }`, so the last writer wins per field but optional
- * fields nobody re-reported survive), an unknown id is appended. Nothing is
- * ever deleted here: a network is shared between hosts, and one host going
- * quiet about it must not tear it out from under the others.
- */
-function mergeById<T extends { id: string }>(existing: T[], incoming: T[]): T[] {
-  const merged = new Map<string, T>(existing.map((e) => [e.id, e]));
-  for (const item of incoming) {
-    const prev = merged.get(item.id);
-    merged.set(item.id, prev ? { ...prev, ...item } : item);
-  }
-  return [...merged.values()];
-}
-
-/**
- * Turn reported facts into the `HostView` the store keeps.
- *
- * A report carries facts only — measurements belong to the health store. The
- * view fields therefore start neutral: the host counts as `up` (it just
- * talked to us via its agent), with no cpu/ram/disk numbers and no uptime.
- * As soon as the health ingest exists, `inventory.service.withHealth` folds
- * real measurements over these defaults on every read.
- */
-function freshHostView(host: HostFacts): HostView {
-  return {
-    ...host,
-    status: 'up',
-    uptime: null,
-    uptimeDays: 0,
-    cpu: null,
-    ram: null,
-    disk: null,
-  };
-}
 
 export function createMemoryStore({ demoData }: { demoData: boolean }): Store {
   // the whole world, in one object. A real driver replaces this with tables;
@@ -106,7 +69,10 @@ export function createMemoryStore({ demoData }: { demoData: boolean }): Store {
      *                   replaced; tunnels merely ending here belong to the peer
      *   • records     — records terminating here (`server === hostId`) are
      *                   replaced; records without a server are shared zone data
-     *                   and merged by id
+     *                   and merged by id. A record id another host already
+     *                   holds is refused (`splitRecordClaims`), because record
+     *                   ids are a global namespace and the validator can only
+     *                   check what a record *claims*, never who holds the id
      *   • networks/zones — shared, merged by id, never deleted (see mergeById)
      *
      * Snapshot semantics follow from the replacement: whatever the report
@@ -120,8 +86,16 @@ export function createMemoryStore({ demoData }: { demoData: boolean }): Store {
       const current = state.inventory;
       const hostId = report.hostId;
 
-      const incomingRecords = report.records ?? [];
+      // this host's own records drop out first, so anything still holding an
+      // id below belongs to somebody else (see facts.ts → splitRecordClaims)
       const keptRecords = current.records.filter((r) => r.server !== hostId);
+      const held = new Map<string, string | null>(
+        keptRecords.map((r) => [r.id as string, (r.server as string | undefined) ?? null]),
+      );
+      const { accepted, rejected } = splitRecordClaims(
+        report.records ?? [],
+        (id) => (held.has(id) ? held.get(id) : undefined),
+      );
 
       state.inventory = {
         hosts: [
@@ -139,11 +113,12 @@ export function createMemoryStore({ demoData }: { demoData: boolean }): Store {
         ],
         zones: mergeById(current.zones, report.zones ?? []),
         records: [
-          ...mergeById(keptRecords, incomingRecords.filter((r) => !r.server)),
-          ...incomingRecords.filter((r) => r.server === hostId),
+          ...mergeById(keptRecords, accepted.filter((r) => !r.server)),
+          ...accepted.filter((r) => r.server === hostId),
         ],
       };
       state.inventoryChangedAt = new Date().toISOString();
+      return { rejectedRecords: rejected };
     },
 
     /**
@@ -209,27 +184,77 @@ export function createMemoryStore({ demoData }: { demoData: boolean }): Store {
     },
   };
 
+  // enrolled agents, keyed by agent id. The token is kept only as its sha-256
+  // hash — authentication compares hashes (agents.auth.ts), the plaintext
+  // exists nowhere but in the enrolment response.
+  const agentRows = new Map<AgentId, { agent: Agent; tokenHash: string }>();
+  const agentConfigs = new Map<AgentId, AgentConfig>();
+
   const agents: AgentRepository = {
-    // list/get answer "nothing enrolled" so the operator ui can render an empty
-    // state instead of an error; every write is a seam.
-    list: async (): Promise<Agent[]> => [],
-    get: async (_id: AgentId): Promise<Agent | null> => null,
-    getByHost: async (_hostId: HostId): Promise<Agent | null> => null,
-    create: async (_agent: Agent, _tokenHash: string) => {
-      throw notImplemented('agent enrolment', `${WHERE} → agents.create`);
+    // id sort, so the operator list is stable across calls
+    list: async (): Promise<Agent[]> => [...agentRows.values()]
+      .map((r) => r.agent)
+      .sort((a, b) => (a.id < b.id ? -1 : 1)),
+    get: async (id: AgentId): Promise<Agent | null> => agentRows.get(id)?.agent ?? null,
+
+    // at most one row per host (create() enforces it), so first hit is the hit;
+    // register() uses this to detect the re-install case
+    getByHost: async (hostId: HostId): Promise<Agent | null> => {
+      for (const { agent } of agentRows.values()) {
+        if (agent.hostId === hostId) return agent;
+      }
+      return null;
     },
-    findByTokenHash: async (_hash: string): Promise<Agent | null> => {
-      throw notImplemented('agent token lookup', `${WHERE} → agents.findByTokenHash`);
+
+    /**
+     * One agent per host: enrolling a host that already has an agent is the
+     * re-install case — the previous row (and with it the old token) is
+     * dropped, and per-agent config follows the host to the new agent id,
+     * because identity lives on `hostId` while credentials rotate (see
+     * docs/agent-identity.md §1).
+     */
+    create: async (agent: Agent, tokenHash: string) => {
+      for (const [id, row] of agentRows) {
+        if (row.agent.hostId === agent.hostId) {
+          agentRows.delete(id);
+          const carried = agentConfigs.get(id);
+          agentConfigs.delete(id);
+          if (carried) agentConfigs.set(agent.id, carried);
+        }
+      }
+      agentRows.set(agent.id, { agent, tokenHash });
     },
-    touch: async (_id: AgentId, _at: Timestamp) => {
-      throw notImplemented('agent liveness', `${WHERE} → agents.touch`);
+
+    // the authentication lookup: plain string equality is fine here — both
+    // sides are sha-256 hashes, so timing can only leak knowledge of a hash,
+    // never of a token (in sql this becomes an indexed `where token_hash = $1`)
+    findByTokenHash: async (hash: string): Promise<Agent | null> => {
+      for (const row of agentRows.values()) {
+        if (row.tokenHash === hash) return row.agent;
+      }
+      return null;
     },
-    revoke: async (_id: AgentId) => {
-      throw notImplemented('agent revocation', `${WHERE} → agents.revoke`);
+
+    // unknown ids are ignored on purpose: a touch can race a re-install, and
+    // liveness for an agent that no longer exists is not an error worth a 500
+    touch: async (id: AgentId, at: Timestamp) => {
+      const row = agentRows.get(id);
+      if (row) row.agent = { ...row.agent, lastSeenAt: at };
     },
-    getConfig: async (_id: AgentId): Promise<AgentConfig | null> => null,
-    setConfig: async (_id: AgentId, _config: AgentConfig) => {
-      throw notImplemented('agent config', `${WHERE} → agents.setConfig`);
+
+    // the row stays (the operator list keeps showing who was revoked and when
+    // it was last seen) — only the status flips, which is what makes the token
+    // hash dead: auth checks the status before accepting the agent
+    revoke: async (id: AgentId) => {
+      const row = agentRows.get(id);
+      if (row) row.agent = { ...row.agent, status: 'revoked' };
+    },
+
+    // per-agent collector config; null means "use the server default"
+    // (agents.service.ts → configFor decides that fallback, not the store)
+    getConfig: async (id: AgentId): Promise<AgentConfig | null> => agentConfigs.get(id) ?? null,
+    setConfig: async (id: AgentId, config: AgentConfig) => {
+      agentConfigs.set(id, config);
     },
   };
 

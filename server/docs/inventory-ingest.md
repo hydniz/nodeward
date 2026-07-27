@@ -73,6 +73,36 @@ gone. What "own share" means per collection:
 field, optional fields nobody re-reported survive, and one host going quiet
 about a shared network cannot tear it out from under the others.
 
+### Record ids are a global namespace
+
+The validator can only check what a record *claims* (`server` must be the
+reporting host) — it cannot see who already **holds** the id, because the store
+is what knows that. Records are the only collection where that gap matters: a
+dns name exists once, so two hosts can name the same record id, and whoever
+writes last would otherwise take the row over. That is a security boundary, not
+a merge detail — it is what stops one compromised machine from re-pointing any
+name in the graph.
+
+So every driver runs the incoming records through `store/facts.ts →
+splitRecordClaims` **after** deleting the reporting host's own records — which
+means any id still held belongs to somebody else:
+
+| the id … | incoming record | result |
+| --- | --- | --- |
+| is free | anything | claimed |
+| holds shared zone data | shared too (no `server`) | merged field-wise |
+| holds shared zone data | claims `server` | **refused** |
+| is held by another host | anything | **refused** |
+
+Refused records are **dropped, not fatal** — the same call as dropping edges
+into unknown networks: one bad entry must not cost the operator the whole
+host's inventory. `applyReport` logs a warning naming the record and its
+holder, so the refusal is visible rather than silent.
+
+A genuine migration (a service moves from `a` to `b`) heals by itself: `a`'s
+next snapshot stops claiming the name, which releases the id, and `b`'s next
+snapshot picks it up — at most one inventory interval (default 10 min) later.
+
 The swap is atomic: the next `Inventory` is built synchronously and assigned
 in one statement, so a reader sees the world before or after the report,
 never a half-applied host. Every write stamps `inventoryChangedAt`, which is

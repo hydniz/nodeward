@@ -1,6 +1,7 @@
 import React from 'react';
-import { NavLink } from 'react-router-dom';
+import { NavLink } from 'react-router';
 import { useApi } from '../api.js';
+import { announceUnauthorized, logout } from '../auth.js';
 
 const mainNav = [
   ['/', 'Overview'],
@@ -19,7 +20,14 @@ const adminNav = [
 
 export default function Sidebar() {
   const { data: summary } = useApi('/api/summary');
+  const { data: me } = useApi('/api/auth/me');
   const alerts = summary?.alerts?.length ?? 0;
+
+  const signOut = async () => {
+    await logout();
+    // the session cookie is gone; the AuthGate takes it from here
+    announceUnauthorized();
+  };
 
   return (
     <aside className="sidebar">
@@ -49,7 +57,12 @@ export default function Sidebar() {
 
       <div className="sidebar-user">
         <span className="avatar" />
-        <span>ops@nyx</span>
+        <span>admin</span>
+        {me?.required && (
+          <button type="button" className="signout" onClick={signOut}>
+            sign out
+          </button>
+        )}
       </div>
     </aside>
   );

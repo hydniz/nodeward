@@ -33,8 +33,33 @@ export function createApp(config: Config, store: Store, log: Logger): App {
   const modules = createModules(config, store, log);
 
   app.disable('x-powered-by');
-  // behind nginx/caddy this makes req.ip and the protocol truthful
-  app.set('trust proxy', true);
+  // what counts as the client ip (rate limits key on it): false when exposed
+  // directly, the hop count behind nginx/caddy — see Config.trustProxy
+  app.set('trust proxy', config.trustProxy);
+
+  // browser hardening, set on every response (spa and api alike). The client
+  // is fully self-contained — no cdn, no external fonts — so the csp can be
+  // strict; 'unsafe-inline' for styles only, because the graph sets style
+  // attributes on its svg. HSTS only in production, where tls (terminated by
+  // the reverse proxy) is a deployment requirement — see docs/security.md.
+  const csp = [
+    "default-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+  app.use((_req, res, next) => {
+    res.setHeader('x-content-type-options', 'nosniff');
+    res.setHeader('x-frame-options', 'DENY');
+    res.setHeader('referrer-policy', 'no-referrer');
+    res.setHeader('content-security-policy', csp);
+    if (config.env === 'production') {
+      res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  });
 
   app.use(requestId(log));
   app.use(requestLog());

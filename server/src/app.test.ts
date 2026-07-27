@@ -24,6 +24,23 @@ describe('app assembly', () => {
     expect(res.headers['x-powered-by']).toBeUndefined();
   });
 
+  it('sets the browser hardening headers on every response', async () => {
+    const { app } = await createTestApp();
+    const res = await request(app).get('/api/servers');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['x-frame-options']).toBe('DENY');
+    expect(res.headers['referrer-policy']).toBe('no-referrer');
+    expect(res.headers['content-security-policy']).toContain("default-src 'self'");
+    // hsts belongs to production, where tls is a deployment requirement
+    expect(res.headers['strict-transport-security']).toBeUndefined();
+  });
+
+  it('sends hsts in production', async () => {
+    const { app } = await createTestApp({ NODE_ENV: 'production', AUTH_DISABLED: 'true' });
+    const res = await request(app).get('/healthz');
+    expect(res.headers['strict-transport-security']).toContain('max-age=');
+  });
+
   it('answers unknown /api paths with a json 404, not the spa', async () => {
     const { app } = await createTestApp();
     const res = await request(app).get('/api/definitely-not-a-route');

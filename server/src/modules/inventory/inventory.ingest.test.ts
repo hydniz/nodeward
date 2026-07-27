@@ -227,8 +227,20 @@ describe('inventory ingest — behaviour', () => {
     expect(nets.body.networks.map((n: { id: string }) => n.id)).toContain('lan');
   });
 
-  // becomes constructible with per-agent tokens (roadmap step 2): with the
-  // shared/dev token the principal's host is derived from the body, so a
-  // mismatch cannot be produced from the outside
-  it.todo('refuses a report whose hostId is not the host the token owns (403)');
+  it('refuses a report whose hostId is not the host the token owns (403)', async () => {
+    const { app } = await createTestApp({ AGENT_JOIN_TOKEN: 'join-secret' });
+    const enrolled = await request(app).post('/api/agents/register').send({
+      joinToken: 'join-secret', hostId: 'other-box', name: 'other-box', version: '1.0.0',
+    });
+    expect(enrolled.status).toBe(201);
+    const { agentId, token } = enrolled.body.credentials;
+
+    // the report claims `testbox`, but the token owns `other-box`
+    const res = await request(app)
+      .post(`/api/agents/${agentId}/inventory`)
+      .set('authorization', `Bearer ${token}`)
+      .send(sampleReport());
+    expect(res.status).toBe(403);
+    expect((await request(app).get('/api/servers/testbox')).status).toBe(404);
+  });
 });

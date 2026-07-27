@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router';
 import { useApi } from '../api.js';
 import RecordModal from '../components/RecordModal.jsx';
 import {

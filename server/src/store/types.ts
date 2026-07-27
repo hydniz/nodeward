@@ -18,10 +18,23 @@ import type {
   InventoryReport, MetricSeries, NetworkFacts, P2PFacts, SeriesInfo, SeriesQuery,
   Timestamp,
 } from '../domain/index.ts';
+import type { RejectedRecord } from './facts.ts';
 
-export type StoreDriverKind = 'memory' | 'postgres';
+export type StoreDriverKind = 'memory' | 'sqlite' | 'postgres';
 
 // ---- inventory ------------------------------------------------------------
+
+/** What `replaceHost` did with the parts of a report it could not simply apply. */
+export interface ReplaceResult {
+  /**
+   * Records the report claimed but another host (or shared zone data) already
+   * holds — dropped rather than applied, per `facts.ts → splitRecordClaims`.
+   * The caller logs them: an agent posting somebody else's record id is either
+   * a service migration mid-flight or a compromised host trying to re-point a
+   * name, and both deserve a line in the log.
+   */
+  rejectedRecords: RejectedRecord[];
+}
 
 export interface InventoryRepository {
   /** everything at once; the topology layout needs the whole picture. */
@@ -42,8 +55,13 @@ export interface InventoryRepository {
    * the report are deleted for that host, and nothing belonging to another host
    * is touched. Must be atomic — a half-applied host would show up as a broken
    * graph.
+   *
+   * "Nothing belonging to another host is touched" is a guarantee this method
+   * owes the caller even when the report says otherwise: dns record ids are a
+   * global namespace, so every driver runs the incoming records through
+   * `facts.ts → splitRecordClaims` and reports what it refused.
    */
-  replaceHost(report: InventoryReport): Promise<void>;
+  replaceHost(report: InventoryReport): Promise<ReplaceResult>;
 
   /** forget a host completely (agent revoked, machine decommissioned). */
   removeHost(id: HostId): Promise<void>;
@@ -87,7 +105,14 @@ export interface AgentRepository {
   get(id: AgentId): Promise<Agent | null>;
   getByHost(hostId: HostId): Promise<Agent | null>;
 
-  /** store a freshly enrolled agent together with the *hash* of its token. */
+  /**
+   * Store a freshly enrolled agent together with the *hash* of its token.
+   *
+   * One agent per host: if an agent already exists for `agent.hostId` it is
+   * replaced (the re-install case — the old token stops working), and its
+   * per-agent config carries over to the new agent id. Identity lives on
+   * `hostId`; credentials rotate (docs/agent-identity.md §1).
+   */
   create(agent: Agent, tokenHash: string): Promise<void>;
 
   /** for authentication: find the agent a presented token belongs to. */
